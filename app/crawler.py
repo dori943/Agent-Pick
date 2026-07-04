@@ -3,16 +3,16 @@
 인스타그램 등 SNS 공개 게시물의 og:description 메타 태그를
 별도 로그인 없이 추출한다.
 
-전략 (Instagram) — 3단계 fallback:
-  1차) HTML GET → og:description 메타 태그 파싱
-  2차) /embed/ 페이지 → 캡션 텍스트 직접 추출
-  3차) oEmbed API (토큰 필요할 수 있어 최후 수단)
+전략 (Instagram):
+  토큰 있을 때 → oEmbed API (공식, 안정적) → HTML OG fallback
+  토큰 없을 때 → HTML OG → embed 페이지 → oEmbed(토큰 없이 시도)
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Final
 from urllib.parse import quote
@@ -45,7 +45,22 @@ _INSTA_PATTERN = re.compile(
     r"https?://(?:www\.)?instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)"
 )
 
-_OEMBED_URL: Final[str] = "https://api.instagram.com/oembed/?url={url}"
+# Facebook Graph API oEmbed (토큰 필요)
+_GRAPH_OEMBED_URL: Final[str] = (
+    "https://graph.facebook.com/v22.0/instagram_oembed"
+    "?url={url}&access_token={token}"
+)
+# 레거시 oEmbed (토큰 없이 되던 엔드포인트, 현재 불안정)
+_LEGACY_OEMBED_URL: Final[str] = "https://api.instagram.com/oembed/?url={url}"
+
+
+# ── 환경변수에서 토큰 로드 ───────────────────────────────
+def _get_meta_token() -> str | None:
+    """환경변수 INSTAGRAM_OEMBED_TOKEN 에서 Meta 앱 토큰을 가져온다."""
+    token = os.getenv("INSTAGRAM_OEMBED_TOKEN")
+    if token:
+        logger.info("Meta oEmbed 토큰 감지됨")
+    return token
 
 
 # ── 헬퍼 ─────────────────────────────────────────────────
@@ -59,7 +74,6 @@ def _get_shortcode(url: str) -> str | None:
 
 
 def _normalize_instagram_url(url: str) -> str:
-    """인스타그램 URL의 쿼리 파라미터를 제거하고 표준화."""
     m = _INSTA_PATTERN.search(url)
     if m:
         return f"https://www.instagram.com/p/{m.group(1)}/"
@@ -67,52 +81,72 @@ def _normalize_instagram_url(url: str) -> str:
 
 
 def _extract_og_tags(html: str) -> dict[str, str]:
-    """HTML에서 주요 Open Graph 메타 태그를 딕셔너리로 추출."""
     soup = BeautifulSoup(html, "html.parser")
     og: dict[str, str] = {}
-
     for tag in soup.find_all("meta", attrs={"property": True}):
         prop: str = tag.get("property", "")
         content: str = tag.get("content", "")
         if prop.startswith("og:") and content:
-            key = prop.replace(":", "_")
-            og[key] = content.strip()
-
+            og[prop.replace(":", "_")] = content.strip()
     title_tag = soup.find("title")
     if title_tag and title_tag.string:
         og["raw_title"] = title_tag.string.strip()
-
     return og
 
 
-# ── 전략 1: HTML OG 태그 ─────────────────────────────────
+# ── 전략: oEmbed (토큰 O) ────────────────────────────────
+async def _try_oembed_with_token(
+    url: str, token: str, client: httpx.AsyncClient
+) -> dict[str, str]:
+    """Graph API oEmbed — Meta 앱 토큰으로 호출. 가장 안정적."""
+    endpoint = _GRAPH_OEMBED_URL.format(
+        url=quote(url, safe=""), token=token
+    )
+    try:
+        resp = await client.get(endpoint)
+        resp.raise_for_status()
+        data = resp.json()
+        logger.info("[oEmbed+토큰] 성공 (키: %s)", list(data.keys()))
+
+        result: dict[str, str] = {"og_site_name": "Instagram"}
+        if data.get("title"):
+            result["og_description"] = data["title"]
+        if data.get("author_name"):
+            result["og_title"] = f"{data['author_name']}의 Instagram 게시물"
+        if data.get("thumbnail_url"):
+            result["og_image"] = data["thumbnail_url"]
+        return result
+    except httpx.HTTPStatusError as exc:
+        logger.warning("[oEmbed+토큰] HTTP %s", exc.response.status_code)
+    except (httpx.RequestError, json.JSONDecodeError) as exc:
+        logger.warning("[oEmbed+토큰] 실패: %s", exc)
+    return {}
+
+
+# ── 전략: HTML OG 태그 ───────────────────────────────────
 async def _try_html_og(url: str, client: httpx.AsyncClient) -> dict[str, str]:
-    """직접 HTML GET → OG 태그 파싱."""
     try:
         resp = await client.get(url)
         resp.raise_for_status()
         og = _extract_og_tags(resp.text)
         if og.get("og_description"):
-            logger.info("[전략1] HTML OG 추출 성공")
+            logger.info("[HTML OG] 추출 성공")
             return og
-        logger.info("[전략1] og:description 비어있음 → 다음 전략으로")
+        logger.info("[HTML OG] og:description 비어있음")
     except httpx.HTTPStatusError as exc:
-        logger.info("[전략1] HTTP %s → 다음 전략으로", exc.response.status_code)
+        logger.info("[HTML OG] HTTP %s", exc.response.status_code)
     except httpx.RequestError as exc:
-        logger.info("[전략1] 네트워크 오류: %s", exc)
+        logger.info("[HTML OG] 네트워크 오류: %s", exc)
     return {}
 
 
-# ── 전략 2: /embed/ 페이지 파싱 ──────────────────────────
+# ── 전략: embed 페이지 ───────────────────────────────────
 async def _try_embed_page(url: str, client: httpx.AsyncClient) -> dict[str, str]:
-    """Instagram /embed/ 페이지는 서버사이드 렌더링이라
-    캡션이 HTML에 직접 포함되어 있다.
-    """
     shortcode = _get_shortcode(url)
     if not shortcode:
         return {}
 
-    embed_url = f"https://www.instagram.com/p/{shortcode}/embed/"
+    embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
     try:
         resp = await client.get(embed_url)
         resp.raise_for_status()
@@ -121,8 +155,7 @@ async def _try_embed_page(url: str, client: httpx.AsyncClient) -> dict[str, str]
 
         caption = ""
 
-        # 방법 A: embed 페이지의 캡션 div
-        # Instagram embed 페이지는 캡션을 다양한 클래스명으로 감쌈
+        # A: 캡션 div
         for selector in [
             "div.Caption",
             "div.CaptionContent",
@@ -134,7 +167,7 @@ async def _try_embed_page(url: str, client: httpx.AsyncClient) -> dict[str, str]
                 caption = el.get_text(separator=" ", strip=True)
                 break
 
-        # 방법 B: embed HTML 내 JSON-LD 또는 인라인 스크립트에서 추출
+        # B: JSON-LD
         if not caption:
             for script in soup.find_all("script", type="application/ld+json"):
                 try:
@@ -146,56 +179,52 @@ async def _try_embed_page(url: str, client: httpx.AsyncClient) -> dict[str, str]
                 except json.JSONDecodeError:
                     continue
 
-        # 방법 C: og 태그가 embed 페이지에 있을 수도 있음
+        # C: embed 페이지의 og 태그
         if not caption:
-            og_embed = _extract_og_tags(html)
-            caption = og_embed.get("og_description", "")
+            caption = _extract_og_tags(html).get("og_description", "")
 
         if caption:
-            logger.info("[전략2] embed 페이지에서 캡션 추출 성공 (%d자)", len(caption))
-            return {
-                "og_description": caption,
-                "og_site_name": "Instagram",
-            }
+            logger.info("[embed] 캡션 추출 성공 (%d자)", len(caption))
+            return {"og_description": caption, "og_site_name": "Instagram"}
 
-        logger.info("[전략2] embed 페이지에서도 캡션 없음 → 다음 전략으로")
+        logger.info("[embed] 캡션 없음")
     except httpx.HTTPStatusError as exc:
-        logger.info("[전략2] embed HTTP %s", exc.response.status_code)
+        logger.info("[embed] HTTP %s", exc.response.status_code)
     except httpx.RequestError as exc:
-        logger.info("[전략2] embed 네트워크 오류: %s", exc)
+        logger.info("[embed] 네트워크 오류: %s", exc)
     return {}
 
 
-# ── 전략 3: oEmbed API ───────────────────────────────────
-async def _try_oembed(url: str, client: httpx.AsyncClient) -> dict[str, str]:
-    """Instagram oEmbed API (토큰 필요할 수 있어 최후 수단)."""
-    oembed_endpoint = _OEMBED_URL.format(url=quote(url, safe=""))
+# ── 전략: oEmbed (토큰 X, 레거시) ────────────────────────
+async def _try_oembed_legacy(url: str, client: httpx.AsyncClient) -> dict[str, str]:
+    endpoint = _LEGACY_OEMBED_URL.format(url=quote(url, safe=""))
     try:
-        resp = await client.get(oembed_endpoint)
+        resp = await client.get(endpoint)
         resp.raise_for_status()
         data = resp.json()
-        logger.info("[전략3] oEmbed 응답 수신")
-
-        result: dict[str, str] = {}
+        logger.info("[oEmbed 레거시] 성공")
+        result: dict[str, str] = {"og_site_name": "Instagram"}
         if data.get("title"):
             result["og_description"] = data["title"]
         if data.get("author_name"):
             result["og_title"] = f"{data['author_name']}의 Instagram 게시물"
         if data.get("thumbnail_url"):
             result["og_image"] = data["thumbnail_url"]
-        result["og_site_name"] = "Instagram"
         return result
     except (httpx.HTTPStatusError, httpx.RequestError, json.JSONDecodeError) as exc:
-        logger.warning("[전략3] oEmbed 실패: %s", exc)
+        logger.warning("[oEmbed 레거시] 실패: %s", exc)
     return {}
 
 
 # ── 공개 API ─────────────────────────────────────────────
-async def crawl_meta(url: str, *, client: httpx.AsyncClient | None = None) -> CrawlResult:
+async def crawl_meta(
+    url: str, *, client: httpx.AsyncClient | None = None
+) -> CrawlResult:
     """주어진 URL의 OG 메타 태그를 크롤링하여 CrawlResult로 반환.
 
-    Instagram의 경우 3단계 fallback 전략을 순차 시도한다:
-      1) HTML OG → 2) embed 페이지 → 3) oEmbed API
+    Instagram의 경우:
+      - INSTAGRAM_OEMBED_TOKEN 환경변수가 있으면 oEmbed API 우선
+      - 없으면 HTML OG → embed → 레거시 oEmbed 순으로 fallback
     """
     normalized = _normalize_instagram_url(url)
     logger.info("crawl_meta 시작: %s", normalized)
@@ -210,17 +239,26 @@ async def crawl_meta(url: str, *, client: httpx.AsyncClient | None = None) -> Cr
         )
 
     try:
-        # 1차: HTML OG 태그
+        og: dict[str, str] = {}
+        is_insta = _is_instagram(normalized)
+
+        # 전략 1: HTML OG 태그
         og = await _try_html_og(normalized, client)
 
-        # Instagram 전용 fallback 체인
-        if not og.get("og_description") and _is_instagram(normalized):
-            # 2차: embed 페이지
+        # 전략 2: Instagram embed 페이지
+        if not og.get("og_description") and is_insta:
             og = await _try_embed_page(normalized, client)
 
-        if not og.get("og_description") and _is_instagram(normalized):
-            # 3차: oEmbed API
-            og = await _try_oembed(normalized, client)
+        # 전략 3: oEmbed API (토큰 필요)
+        if not og.get("og_description") and is_insta:
+            token = _get_meta_token()
+            if token:
+                og = await _try_oembed_with_token(normalized, token, client)
+            else:
+                logger.warning(
+                    "INSTAGRAM_OEMBED_TOKEN 환경변수 미설정 → oEmbed 전략 건너뜀. "
+                    "Meta 앱 토큰을 발급받아 설정하세요."
+                )
 
         if not og.get("og_description"):
             logger.warning("모든 추출 전략 실패: %s", normalized)
