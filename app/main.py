@@ -11,6 +11,9 @@ import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+from dotenv import load_dotenv
+load_dotenv()  # .env 파일에서 환경변수 로드
+
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
