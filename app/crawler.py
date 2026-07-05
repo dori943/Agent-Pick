@@ -3,9 +3,10 @@
 인스타그램 등 SNS 공개 게시물의 og:description 메타 태그를
 별도 로그인 없이 추출한다.
 
-전략 (Instagram):
-  토큰 있을 때 → oEmbed API (공식, 안정적) → HTML OG fallback
-  토큰 없을 때 → HTML OG → embed 페이지 → oEmbed(토큰 없이 시도)
+전략 (Instagram) — 3단계 fallback:
+  1차) 쿠키 기반 HTML OG — 인스타 홈페이지에서 세션 쿠키를 받은 뒤 게시물 요청
+  2차) /embed/captioned/ 페이지 파싱
+  3차) Graph API oEmbed (META_ACCESS_TOKEN 필요)
 """
 
 from __future__ import annotations
@@ -45,21 +46,39 @@ _INSTA_PATTERN = re.compile(
     r"https?://(?:www\.)?instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)"
 )
 
-# Facebook Graph API oEmbed (토큰 필요)
+# Graph API oEmbed — access_token은 "앱ID|클라이언트토큰" 형식
 _GRAPH_OEMBED_URL: Final[str] = (
     "https://graph.facebook.com/v22.0/instagram_oembed"
     "?url={url}&access_token={token}"
 )
-# 레거시 oEmbed (토큰 없이 되던 엔드포인트, 현재 불안정)
-_LEGACY_OEMBED_URL: Final[str] = "https://api.instagram.com/oembed/?url={url}"
 
 
-# ── 환경변수에서 토큰 로드 ───────────────────────────────
+# ── 환경변수 ─────────────────────────────────────────────
 def _get_meta_token() -> str | None:
-    """환경변수 INSTAGRAM_OEMBED_TOKEN 에서 Meta 앱 토큰을 가져온다."""
-    token = os.getenv("INSTAGRAM_OEMBED_TOKEN")
-    if token:
-        logger.info("Meta oEmbed 토큰 감지됨")
+    """META_ACCESS_TOKEN 환경변수를 가져온다.
+
+    Graph API oEmbed는 앱 액세스 토큰 형식 "앱ID|클라이언트토큰"을 요구.
+    .env에 META_APP_ID가 있으면 자동으로 조합한다.
+    """
+    token = os.getenv("META_ACCESS_TOKEN", "")
+    app_id = os.getenv("META_APP_ID", "")
+
+    if not token:
+        return None
+
+    # 이미 "앱ID|토큰" 형식이면 그대로 사용
+    if "|" in token:
+        logger.info("Meta 앱 액세스 토큰 감지됨 (파이프 형식)")
+        return token
+
+    # META_APP_ID가 있으면 "앱ID|클라이언트토큰" 조합
+    if app_id:
+        combined = f"{app_id}|{token}"
+        logger.info("Meta 토큰 조합: APP_ID|CLIENT_TOKEN")
+        return combined
+
+    # 클라이언트 토큰 단독 — 그래도 시도는 해봄
+    logger.info("Meta 클라이언트 토큰 단독 사용 (400 에러 시 META_APP_ID 설정 필요)")
     return token
 
 
@@ -94,54 +113,51 @@ def _extract_og_tags(html: str) -> dict[str, str]:
     return og
 
 
-# ── 전략: oEmbed (토큰 O) ────────────────────────────────
-async def _try_oembed_with_token(
-    url: str, token: str, client: httpx.AsyncClient
+# ── 전략 1: 쿠키 기반 HTML OG ────────────────────────────
+async def _try_html_og_with_cookies(
+    url: str, client: httpx.AsyncClient
 ) -> dict[str, str]:
-    """Graph API oEmbed — Meta 앱 토큰으로 호출. 가장 안정적."""
-    endpoint = _GRAPH_OEMBED_URL.format(
-        url=quote(url, safe=""), token=token
+    """인스타그램 홈에 먼저 접속해서 세션 쿠키를 받고,
+    그 쿠키를 포함해 게시물 페이지를 요청한다.
+    브라우저가 OG 태그를 받을 수 있는 이유가 바로 이 쿠키 때문.
+    """
+    # 쿠키를 자동으로 저장/전송할 전용 클라이언트
+    cookie_client = httpx.AsyncClient(
+        headers=_HEADERS,
+        timeout=httpx.Timeout(_TIMEOUT),
+        follow_redirects=True,
+        max_redirects=_MAX_REDIRECTS,
+        cookies=httpx.Cookies(),
     )
     try:
-        resp = await client.get(endpoint)
+        # Step 1: 인스타 홈에 접속 → 세션 쿠키 수신
+        logger.info("[전략1] 인스타그램 홈 접속 → 쿠키 수집")
+        await cookie_client.get("https://www.instagram.com/")
+
+        # Step 2: 쿠키가 포함된 상태로 게시물 페이지 요청
+        resp = await cookie_client.get(url)
         resp.raise_for_status()
-        data = resp.json()
-        logger.info("[oEmbed+토큰] 성공 (키: %s)", list(data.keys()))
 
-        result: dict[str, str] = {"og_site_name": "Instagram"}
-        if data.get("title"):
-            result["og_description"] = data["title"]
-        if data.get("author_name"):
-            result["og_title"] = f"{data['author_name']}의 Instagram 게시물"
-        if data.get("thumbnail_url"):
-            result["og_image"] = data["thumbnail_url"]
-        return result
-    except httpx.HTTPStatusError as exc:
-        logger.warning("[oEmbed+토큰] HTTP %s", exc.response.status_code)
-    except (httpx.RequestError, json.JSONDecodeError) as exc:
-        logger.warning("[oEmbed+토큰] 실패: %s", exc)
-    return {}
-
-
-# ── 전략: HTML OG 태그 ───────────────────────────────────
-async def _try_html_og(url: str, client: httpx.AsyncClient) -> dict[str, str]:
-    try:
-        resp = await client.get(url)
-        resp.raise_for_status()
         og = _extract_og_tags(resp.text)
         if og.get("og_description"):
-            logger.info("[HTML OG] 추출 성공")
+            logger.info("[전략1] 쿠키 기반 HTML OG 추출 성공")
             return og
-        logger.info("[HTML OG] og:description 비어있음")
+
+        logger.info("[전략1] 쿠키 있어도 og:description 비어있음")
     except httpx.HTTPStatusError as exc:
-        logger.info("[HTML OG] HTTP %s", exc.response.status_code)
+        logger.info("[전략1] HTTP %s", exc.response.status_code)
     except httpx.RequestError as exc:
-        logger.info("[HTML OG] 네트워크 오류: %s", exc)
+        logger.info("[전략1] 네트워크 오류: %s", exc)
+    finally:
+        await cookie_client.aclose()
     return {}
 
 
-# ── 전략: embed 페이지 ───────────────────────────────────
+# ── 전략 2: embed 페이지 ─────────────────────────────────
 async def _try_embed_page(url: str, client: httpx.AsyncClient) -> dict[str, str]:
+    """Instagram /embed/captioned/ 페이지는 서버사이드 렌더링이라
+    캡션이 HTML에 직접 포함되어 있을 수 있다.
+    """
     shortcode = _get_shortcode(url)
     if not shortcode:
         return {}
@@ -155,7 +171,7 @@ async def _try_embed_page(url: str, client: httpx.AsyncClient) -> dict[str, str]
 
         caption = ""
 
-        # A: 캡션 div
+        # A: 캡션 div (클래스명은 인스타가 자주 바꿈)
         for selector in [
             "div.Caption",
             "div.CaptionContent",
@@ -179,30 +195,36 @@ async def _try_embed_page(url: str, client: httpx.AsyncClient) -> dict[str, str]
                 except json.JSONDecodeError:
                     continue
 
-        # C: embed 페이지의 og 태그
+        # C: embed 페이지에도 og 태그가 있을 수 있음
         if not caption:
             caption = _extract_og_tags(html).get("og_description", "")
 
         if caption:
-            logger.info("[embed] 캡션 추출 성공 (%d자)", len(caption))
+            logger.info("[전략2] embed 캡션 추출 성공 (%d자)", len(caption))
             return {"og_description": caption, "og_site_name": "Instagram"}
 
-        logger.info("[embed] 캡션 없음")
+        logger.info("[전략2] embed 캡션 없음")
     except httpx.HTTPStatusError as exc:
-        logger.info("[embed] HTTP %s", exc.response.status_code)
+        logger.info("[전략2] HTTP %s", exc.response.status_code)
     except httpx.RequestError as exc:
-        logger.info("[embed] 네트워크 오류: %s", exc)
+        logger.info("[전략2] 네트워크 오류: %s", exc)
     return {}
 
 
-# ── 전략: oEmbed (토큰 X, 레거시) ────────────────────────
-async def _try_oembed_legacy(url: str, client: httpx.AsyncClient) -> dict[str, str]:
-    endpoint = _LEGACY_OEMBED_URL.format(url=quote(url, safe=""))
+# ── 전략 3: oEmbed API (토큰) ────────────────────────────
+async def _try_oembed_with_token(
+    url: str, token: str, client: httpx.AsyncClient
+) -> dict[str, str]:
+    """Graph API oEmbed — Meta 앱 토큰으로 호출."""
+    endpoint = _GRAPH_OEMBED_URL.format(
+        url=quote(url, safe=""), token=token
+    )
     try:
         resp = await client.get(endpoint)
         resp.raise_for_status()
         data = resp.json()
-        logger.info("[oEmbed 레거시] 성공")
+        logger.info("[전략3] oEmbed 성공 (키: %s)", list(data.keys()))
+
         result: dict[str, str] = {"og_site_name": "Instagram"}
         if data.get("title"):
             result["og_description"] = data["title"]
@@ -211,8 +233,12 @@ async def _try_oembed_legacy(url: str, client: httpx.AsyncClient) -> dict[str, s
         if data.get("thumbnail_url"):
             result["og_image"] = data["thumbnail_url"]
         return result
-    except (httpx.HTTPStatusError, httpx.RequestError, json.JSONDecodeError) as exc:
-        logger.warning("[oEmbed 레거시] 실패: %s", exc)
+    except httpx.HTTPStatusError as exc:
+        # 에러 응답 본문을 로깅해서 원인 파악
+        body = exc.response.text[:300]
+        logger.warning("[전략3] HTTP %s — %s", exc.response.status_code, body)
+    except (httpx.RequestError, json.JSONDecodeError) as exc:
+        logger.warning("[전략3] 실패: %s", exc)
     return {}
 
 
@@ -222,9 +248,7 @@ async def crawl_meta(
 ) -> CrawlResult:
     """주어진 URL의 OG 메타 태그를 크롤링하여 CrawlResult로 반환.
 
-    Instagram의 경우:
-      - INSTAGRAM_OEMBED_TOKEN 환경변수가 있으면 oEmbed API 우선
-      - 없으면 HTML OG → embed → 레거시 oEmbed 순으로 fallback
+    Instagram 전략: 쿠키 HTML OG → embed 페이지 → oEmbed(토큰)
     """
     normalized = _normalize_instagram_url(url)
     logger.info("crawl_meta 시작: %s", normalized)
@@ -242,22 +266,21 @@ async def crawl_meta(
         og: dict[str, str] = {}
         is_insta = _is_instagram(normalized)
 
-        # 전략 1: HTML OG 태그
-        og = await _try_html_og(normalized, client)
+        # 전략 1: 쿠키 기반 HTML OG
+        og = await _try_html_og_with_cookies(normalized, client)
 
-        # 전략 2: Instagram embed 페이지
+        # 전략 2: embed 페이지
         if not og.get("og_description") and is_insta:
             og = await _try_embed_page(normalized, client)
 
-        # 전략 3: oEmbed API (토큰 필요)
+        # 전략 3: oEmbed API (토큰)
         if not og.get("og_description") and is_insta:
             token = _get_meta_token()
             if token:
                 og = await _try_oembed_with_token(normalized, token, client)
             else:
                 logger.warning(
-                    "INSTAGRAM_OEMBED_TOKEN 환경변수 미설정 → oEmbed 전략 건너뜀. "
-                    "Meta 앱 토큰을 발급받아 설정하세요."
+                    "META_ACCESS_TOKEN 환경변수 미설정 → oEmbed 전략 건너뜀"
                 )
 
         if not og.get("og_description"):
