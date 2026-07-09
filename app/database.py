@@ -33,7 +33,11 @@ class NotionDatabaseSaver:
         - address         -> rich_text   (only for category == "place")
         - map_deeplink    -> url         (only for category == "place")
         - event_date      -> date        (only for category == "event")
+        - status          -> select      (e.g. "success" / "failed"), used for debugging
+        - error_log       -> rich_text   (error message when status == "failed")
     """
+
+    VALID_CATEGORIES = {"place", "event", "recipe", "tip", "other"}
 
     def __init__(self, notion_token: str, database_id: str):
         """
@@ -59,6 +63,8 @@ class NotionDatabaseSaver:
         crawl_data: Dict[str, Any],
         analysis_data: Dict[str, Any],
         deeplink_data: Optional[Dict[str, Any]] = None,
+        status: str = "success",
+        error_message: Optional[str] = None,
     ) -> bool:
         """
         Build a Notion page properties payload from the three input
@@ -72,6 +78,12 @@ class NotionDatabaseSaver:
             deeplink_data: Result from the deeplink generator module.
                 Expected keys: "map_deeplink". Optional overall, and only
                 meaningful when category == "place".
+            status: Pipeline outcome for this archive, e.g. "success" or
+                "failed". Recorded so a failed run (e.g. crawl succeeded but
+                deeplink generation failed) is still visible in Notion for
+                debugging, instead of leaving no trace at all.
+            error_message: Optional error detail to store when status is
+                "failed". Ignored when status == "success".
 
         Returns:
             True if the page was created successfully, False otherwise.
@@ -79,7 +91,9 @@ class NotionDatabaseSaver:
         deeplink_data = deeplink_data or {}
 
         try:
-            properties = self._build_properties(crawl_data, analysis_data, deeplink_data)
+            properties = self._build_properties(
+                crawl_data, analysis_data, deeplink_data, status, error_message
+            )
 
             response = self.client.pages.create(
                 parent={"database_id": self.database_id},
@@ -111,6 +125,66 @@ class NotionDatabaseSaver:
             print(f"  - Reason: {e}")
             return False
 
+    def find_by_url(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        Look up an existing page in the database by source url.
+
+        This is the piece that makes the "token saving" cache work: before
+        the pipeline spends new LLM/deeplink tokens on an Instagram post,
+        the server should call this first. If a matching row already
+        exists, its saved map_deeplink / summary can be reused directly.
+
+        Args:
+            url: The Instagram post url to search for.
+
+        Returns:
+            A dict with the cached fields (page_id, url, map_deeplink,
+            summary, status) if a match is found, otherwise None.
+        """
+        if not url:
+            return None
+
+        try:
+            response = self.client.databases.query(
+                database_id=self.database_id,
+                filter={"property": "url", "url": {"equals": url}},
+                page_size=1,
+            )
+        except APIResponseError as e:
+            print("[ERROR] Notion API responded with an error while querying cache.")
+            print(f"  - Reason: {e}")
+            return None
+        except Exception as e:
+            print("[ERROR] Unexpected error while querying Notion cache.")
+            print(f"  - Reason: {e}")
+            return None
+
+        results = response.get("results", [])
+        if not results:
+            return None
+
+        page = results[0]
+        props = page.get("properties", {})
+
+        def _get_url(prop_name: str) -> Optional[str]:
+            return props.get(prop_name, {}).get("url")
+
+        def _get_rich_text(prop_name: str) -> str:
+            blocks = props.get(prop_name, {}).get("rich_text", [])
+            return "".join(block.get("plain_text", "") for block in blocks)
+
+        def _get_select(prop_name: str) -> Optional[str]:
+            select = props.get(prop_name, {}).get("select")
+            return select.get("name") if select else None
+
+        return {
+            "page_id": page.get("id"),
+            "url": _get_url("url"),
+            "map_deeplink": _get_url("map_deeplink"),
+            "summary": _get_rich_text("summary"),
+            "status": _get_select("status"),
+        }
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -133,6 +207,8 @@ class NotionDatabaseSaver:
         crawl_data: Dict[str, Any],
         analysis_data: Dict[str, Any],
         deeplink_data: Dict[str, Any],
+        status: str = "success",
+        error_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Convert the three input dictionaries into a Notion "properties"
@@ -140,7 +216,13 @@ class NotionDatabaseSaver:
         docstring.
         """
         category = analysis_data.get("category", "other")
+        if category not in self.VALID_CATEGORIES:
+            category = "other"
+
         tags = analysis_data.get("tags") or []
+        if not isinstance(tags, list):
+            tags = []
+
         url = crawl_data.get("url", "")
         summary = analysis_data.get("summary", "")
 
@@ -166,7 +248,19 @@ class NotionDatabaseSaver:
                     {"text": {"content": summary}}
                 ]
             },
+            "status": {
+                "select": {"name": status}
+            },
         }
+
+        # Only record an error_log entry when there's actually an error
+        # message, to avoid cluttering successful rows with an empty field.
+        if status != "success" and error_message:
+            properties["error_log"] = {
+                "rich_text": [
+                    {"text": {"content": str(error_message)[:2000]}}
+                ]
+            }
 
         # Conditional properties: only attached when relevant to the category.
         if category == "place":

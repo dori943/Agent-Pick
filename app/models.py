@@ -10,6 +10,12 @@ class ArchiveRequest(BaseModel):
     """단축어(Shortcut)로부터 전달받는 요청 바디."""
 
     url: HttpUrl = Field(..., description="아카이빙할 SNS 게시물 URL")
+    notion_access_token: str | None = Field(
+        None, description="클라이언트가 보관 중인 Notion access_token (없으면 서버 .env 기본값 사용)"
+    )
+    notion_database_id: str | None = Field(
+        None, description="클라이언트가 보관 중인 Notion database_id"
+    )
 
 
 # ── Crawler → LLM ────────────────────────────────────────
@@ -55,6 +61,7 @@ class ArchiveResponse(BaseModel):
     """클라이언트(단축어)에 최종 반환하는 응답."""
 
     success: bool
+    cached: bool = False
     crawl: CrawlResult | None = None
     analysis: AnalysisResult | None = None
     deeplinks: DeeplinkResult | None = None

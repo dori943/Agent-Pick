@@ -98,6 +98,10 @@ def _normalize_instagram_url(url: str) -> str:
         return f"https://www.instagram.com/p/{m.group(1)}/"
     return url
 
+#공개함수
+def normalize_url(url: str) -> str:
+    """인스타그램 URL이면 정규 형태(/p/{shortcode}/)로, 아니면 그대로 반환."""
+    return _normalize_instagram_url(url)
 
 def _extract_og_tags(html: str) -> dict[str, str]:
     soup = BeautifulSoup(html, "html.parser")
