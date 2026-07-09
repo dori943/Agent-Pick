@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 
 from app.models import ArchiveRequest, ArchiveResponse
 from app.crawler import crawl_meta
-from app.llm_analyzer import analyze
+from app.llm_analyzer import LLMAnalyzer
 from app.deeplink import generate_deeplinks
 
 # ── 로깅 ─────────────────────────────────────────────────
@@ -111,7 +111,9 @@ async def archive(req: ArchiveRequest, request: Request) -> ArchiveResponse:
         )
 
     # ② LLM 분석
-    analysis_result = await analyze(crawl_result)
+    llm_analyzer = LLMAnalyzer()
+    analysis_result = await llm_analyzer.analyze(crawl_result)
+    print(analysis_result)
 
     # ③ 딥링크 생성
     deeplink_result = await generate_deeplinks(analysis_result)

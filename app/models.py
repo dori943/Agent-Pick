@@ -39,6 +39,7 @@ class AnalysisResult(BaseModel):
     event_title: str | None = Field(None, description="일정 제목 (event일 때)")
     event_date: str | None = Field(None, description="ISO-8601 날짜 (event일 때)")
     tags: list[str] = Field(default_factory=list, description="해시태그 / 키워드")
+    region: str | None = Field(None, description="지역명 (예: 연남동) — 네이버 매칭 대조용")
 
 
 # ── 딥링크 ───────────────────────────────────────────────
