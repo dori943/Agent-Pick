@@ -7,9 +7,20 @@ from pydantic import BaseModel, Field, HttpUrl
 
 # ── Request ──────────────────────────────────────────────
 class ArchiveRequest(BaseModel):
-    """단축어(Shortcut)로부터 전달받는 요청 바디."""
+    """단축어(Shortcut)로부터 전달받는 요청 바디.
+
+    notion_token / database_id는 /callback에서 발급받은 유저별 값을
+    단축어가 그대로 실어 보내기 위한 필드. 비워서 보내면 main.py가
+    서버 전역 .env(NOTION_TOKEN / NOTION_DATABASE_ID) 값으로 폴백한다.
+    """
 
     url: HttpUrl = Field(..., description="아카이빙할 SNS 게시물 URL")
+    notion_token: str | None = Field(
+        None, description="유저별 Notion 액세스 토큰 (/callback에서 발급, 없으면 서버 기본값 사용)"
+    )
+    database_id: str | None = Field(
+        None, description="유저별 Notion 데이터베이스 ID (/callback에서 발급, 없으면 서버 기본값 사용)"
+    )
 
 
 # ── Crawler → LLM ────────────────────────────────────────
@@ -31,7 +42,7 @@ class AnalysisResult(BaseModel):
     category: str = Field(
         ..., description="콘텐츠 카테고리 (place | event | recipe | tip | other)"
     )
-    summary: str = Field(..., description="한 줄 요약")
+    summary: str = Field("", description="한 줄 요약 (LLM 실패 시에도 빈 문자열로 안전하게 처리)")
     place_name: str | None = Field(None, description="장소명 (place일 때)")
     address: str | None = Field(None, description="주소 (place일 때)")
     latitude: float | None = Field(None, description="위도")

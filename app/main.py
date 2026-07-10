@@ -11,17 +11,19 @@ import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+import os
 from dotenv import load_dotenv
 load_dotenv()  # .env 파일에서 환경변수 로드
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse # OK.로그인창 화면 전환용
 
 from app.models import ArchiveRequest, ArchiveResponse
 from app.crawler import crawl_meta
 from app.llm_analyzer import LLMAnalyzer
 from app.deeplink import generate_deeplinks
+from app.database import NotionDatabaseSaver # OK.노션적재클래스
 
 # ── 로깅 ─────────────────────────────────────────────────
 logging.basicConfig(
@@ -29,6 +31,10 @@ logging.basicConfig(
     format="%(asctime)s │ %(levelname)-7s │ %(name)s │ %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+CLIENT_ID = os.getenv("NOTION_CLIENT_ID")
+CLIENT_SECRET = os.getenv("NOTION_CLIENT_SECRET")
+REDIRECT_URI = os.getenv("NOTION_REDIRECT_URI")
 
 
 # ── Lifespan: httpx 클라이언트 풀 관리 ───────────────────
@@ -85,6 +91,70 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/login")
+async def login_notion() -> RedirectResponse:
+    """사용자가 접속하면 노션 OAuth 인증 페이지로 자동 리다이렉트합니다."""
+    notion_auth_url = (
+        f"https://api.notion.com/v1/oauth/authorize?"
+        f"client_id={CLIENT_ID}&"
+        f"redirect_uri={REDIRECT_URI}&"
+        f"response_type=code&"
+        f"owner=user"
+    )
+    logger.info("사용자를 노션 OAuth 로그인 화면으로 이동시킵니다.")
+    return RedirectResponse(url=notion_auth_url)
+
+
+
+@app.get("/callback")
+async def notion_callback(code: str | None = None, error: str | None = None) -> dict[str, str]:
+    """노션이 던져준 임시 code를 낚아채서 사용자의 진짜 Access Token과 교환합니다."""
+    
+    if error:
+        logger.error("사용자가 노션 연동을 거부했습니다: %s", error)
+        raise HTTPException(status_code=400, detail=f"Notion login denied: {error}")
+    
+    if not code:
+        logger.error("주소창에 authorization code가 존재하지 않습니다.")
+        raise HTTPException(status_code=400, detail="Missing authorization code.")
+
+    logger.info("임시 code를 사용자의 진짜 영구 액세스 토큰으로 교환 요청 중...")
+    
+    async with httpx.AsyncClient() as client:
+        
+        response = await client.post(
+            "https://api.notion.com/v1/oauth/token",
+            auth=(CLIENT_ID, CLIENT_SECRET),
+            json={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI
+            },
+            headers={"Content-Type": "application/json"}
+        )
+        
+    
+    token_data = response.json()
+    
+    if response.status_code != 200:
+        logger.error("노션 OAuth 토큰 교환 실패")
+        return {"error": "Failed to exchange token", "details": str(token_data)}
+
+    
+    user_access_token = token_data.get("access_token")
+    
+    user_database_id = token_data.get("duplicated_template_id")
+
+    logger.info("노션 로그인 및 데이터베이스 연동이 성공적으로 완료되었습니다!")
+    
+    return {
+        "status": "Authentication Successful",
+        "message": "이제 스마트폰 단축어를 사용해 서비스를 이용하실 수 있습니다!",
+        "database_id": str(user_database_id),
+        "access_token":str(user_access_token)
+    }
+
+
 # ── 핵심 엔드포인트 ──────────────────────────────────────
 @app.post("/archive", response_model=ArchiveResponse)
 async def archive(req: ArchiveRequest, request: Request) -> ArchiveResponse:
@@ -113,10 +183,36 @@ async def archive(req: ArchiveRequest, request: Request) -> ArchiveResponse:
     # ② LLM 분석
     llm_analyzer = LLMAnalyzer()
     analysis_result = await llm_analyzer.analyze(crawl_result)
-    print(analysis_result)
 
     # ③ 딥링크 생성
     deeplink_result = await generate_deeplinks(analysis_result)
+
+    user_token = req.notion_token or os.getenv("NOTION_TOKEN")
+    user_database_id = req.database_id or os.getenv("NOTION_DATABASE_ID")
+
+    if not user_token or not user_database_id:
+        logger.error("노션 토큰/데이터베이스 ID 미설정 → 적재 불가")
+        raise HTTPException(
+            status_code=401,
+            detail="노션 연동 정보가 없습니다. /login으로 먼저 노션 계정을 연동해주세요.",
+        )
+
+    logger.info("▶ 노션 데이터베이스 최종 적재 시작 (Target DB ID: %s)", user_database_id)
+
+    try:
+        saver = NotionDatabaseSaver(notion_token=user_token, database_id=user_database_id)
+    except ValueError as e:
+        logger.error("노션 클라이언트 초기화 실패: %s", e)
+        raise HTTPException(status_code=400, detail=f"노션 연동 정보가 올바르지 않습니다: {e}")
+
+    notion_success = saver.save_archive(
+        crawl_data=crawl_result.model_dump(),
+        analysis_data=analysis_result.model_dump(),
+        deeplink_data=deeplink_result.model_dump() if deeplink_result else {}
+    )
+
+    if not notion_success:
+        logger.error("❌ 노션 데이터베이스 데이터 보존 작업 중 크리티컬 실패 발생")
 
     elapsed = time.perf_counter() - t0
     logger.info("✔ 파이프라인 완료 (%.2fs): category=%s", elapsed, analysis_result.category)

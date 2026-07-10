@@ -97,6 +97,15 @@ def build_nmap_deeplink(lat: float, lng: float, name: str) -> str:
     )
 
 
+def build_nmap_search_deeplink(query: str) -> str:
+    """검색어(지번주소/상호명)로 네이버 지도 앱의 검색 결과를 바로 띄우는 딥링크.
+
+    좌표를 모르거나 네이버 지역 검색 API 키가 없어도 동작한다.
+    query에는 지번주소만, 상호명만, 혹은 둘을 조합한 문자열이 올 수 있다.
+    """
+    return f"nmap://search?query={quote(query)}&appname=agent_pick"
+
+
 def naver_search_web_url(place_name: str) -> str:
     """예외처리용: 네이버 지도 검색창 웹 URL."""
     return f"https://map.naver.com/v5/search/{quote(place_name)}"
