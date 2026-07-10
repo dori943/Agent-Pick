@@ -187,8 +187,8 @@ async def archive(req: ArchiveRequest, request: Request) -> ArchiveResponse:
     # ③ 딥링크 생성
     deeplink_result = await generate_deeplinks(analysis_result)
 
-    user_token = req.notion_token or os.getenv("NOTION_TOKEN")
-    user_database_id = req.database_id or os.getenv("NOTION_DATABASE_ID")
+    user_token = os.getenv("NOTION_TOKEN")
+    user_database_id = os.getenv("NOTION_DATABASE_ID")
 
     if not user_token or not user_database_id:
         logger.error("노션 토큰/데이터베이스 ID 미설정 → 적재 불가")

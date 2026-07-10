@@ -9,10 +9,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import time
 from typing import Any, Final
 
 from google import genai
@@ -31,6 +33,17 @@ if not GEMINI_API_KEY:
 
 # Gemini 클라이언트 생성 (비동기 호출은 client.aio 사용)
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# ── 429(Rate Limit) 대응 설정 ────────────────────────────
+_MAX_INPUT_CHARS: Final = 4000  # 제미나이에 보내는 본문 최대 길이 (토큰 절약)
+_MIN_REQUEST_INTERVAL: Final = 2.0  # 연속 호출 사이 최소 간격(초) — 무료 플랜 RPM 방어
+_MAX_RETRIES: Final = 3
+_RETRY_BACKOFF_BASE: Final = 3.0  # 초. 429 발생 시 시도 횟수만큼 지수적으로 대기
+
+# /archive 요청이 동시에 여러 건 들어와도 Gemini 호출은 이 락을 거쳐
+# 전역적으로 최소 간격을 지키도록 한다 (단순 for-loop sleep보다 견고함).
+_rate_limit_lock = asyncio.Lock()
+_last_call_ts: float = 0.0
 
 # ── 팀 공용 category 스펙 (models.py / deeplink.py / database.py와 동일해야 함) ──
 _VALID_CATEGORIES: Final = {"place", "event", "recipe", "tip", "other"}
@@ -151,10 +164,105 @@ def _fallback_summary(raw_text: str) -> str:
     return "요약 정보를 추출하지 못했습니다."
 
 
+def _clean_and_truncate(
+    text: str, max_chars: int = _MAX_INPUT_CHARS, tail_ratio: float = 0.4
+) -> str:
+    """제미나이에 보낼 본문에서 불필요한 공백/개행을 줄이고 길이를 제한한다.
+
+    토큰(=요금/RPM 제한) 절약이 목적. 단, 인스타 캡션은 보통
+
+        [도입부 스토리텔링]
+        -
+        📍 상호명 / 주소
+        ⏰ 영업시간
+
+    처럼 상호명·주소 같은 핵심 정보가 맨 뒤에 몰리는 경우가 많다.
+    그래서 뒤를 그냥 잘라내지 않고, 앞부분(맥락)과 뒷부분(핵심 정보)을
+    둘 다 남기고 중간만 생략한다. tail_ratio는 뒤쪽에 배분하는 비율
+    (기본 40%) — 상호명/주소가 잘릴 위험을 줄이기 위해 앞보다 넉넉히 준다.
+    """
+    if not text:
+        return text
+    cleaned = re.sub(r"\n{3,}", "\n\n", text.strip())  # 과도한 빈 줄 압축
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)  # 연속 공백 압축
+
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    marker = "\n...(중략)...\n"
+    budget = max(max_chars - len(marker), 0)
+    tail_len = int(budget * tail_ratio)
+    head_len = budget - tail_len
+
+    head = cleaned[:head_len].rstrip()
+    tail = cleaned[-tail_len:].lstrip() if tail_len > 0 else ""
+    return f"{head}{marker}{tail}" if tail else head
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """429 / RESOURCE_EXHAUSTED 계열 에러인지 판별."""
+    text = str(exc)
+    return (
+        "429" in text
+        or "RESOURCE_EXHAUSTED" in text
+        or "rate limit" in text.lower()
+        or "quota" in text.lower()
+    )
+
+
 class LLMAnalyzer:
     def __init__(self):
         self.client = genai_client
-        self.model = "gemini-2.0-flash"
+        self.model = "gemini-3.5-flash"
+
+    async def _call_gemini_with_retry(self, prompt: str) -> str:
+        """전역 최소 호출 간격을 지키며 Gemini를 호출하고,
+        429(rate limit)가 뜨면 지수 백오프로 재시도한다.
+
+        모든 시도가 실패해도 예외를 던지지 않고 빈 문자열을 반환한다
+        (analyze()가 이후 폴백 로직으로 안전하게 처리하도록).
+        """
+        global _last_call_ts
+
+        for attempt in range(1, _MAX_RETRIES + 1):
+            # 여러 요청이 동시에 들어와도 Gemini 호출은 순차적으로,
+            # 최소 _MIN_REQUEST_INTERVAL초 간격을 두고 나가도록 보장
+            async with _rate_limit_lock:
+                elapsed = time.monotonic() - _last_call_ts
+                if elapsed < _MIN_REQUEST_INTERVAL:
+                    await asyncio.sleep(_MIN_REQUEST_INTERVAL - elapsed)
+                _last_call_ts = time.monotonic()
+
+            try:
+                response = await self.client.aio.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        max_output_tokens=2000,
+                        # JSON 형식 강제 → 마크다운 코드블록 없이 순수 JSON 응답
+                        response_mime_type="application/json",
+                        # gemini-3.5-flash는 기본적으로 내부 reasoning(thinking) 토큰을
+                        # max_output_tokens 예산에서 함께 소비한다. thinking_budget=0으로
+                        # 꺼주지 않으면 실제 JSON 출력분이 부족해져 응답이 중간에 잘린다.
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                return (response.text or "").strip()
+            except Exception as e:
+                if _is_rate_limit_error(e) and attempt < _MAX_RETRIES:
+                    backoff = _RETRY_BACKOFF_BASE * attempt
+                    logger.warning(
+                        "[%d/%d] Gemini 429(rate limit) 감지 → %.1f초 대기 후 재시도",
+                        attempt,
+                        _MAX_RETRIES,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                logger.error("Gemini API 호출 실패: %s", e)
+                return ""
+        return ""
 
     async def analyze(self, crawl_result: Any) -> AnalysisResult:
         """크롤링 결과를 Gemini로 분석해 AnalysisResult로 반환.
@@ -164,24 +272,10 @@ class LLMAnalyzer:
         /archive 단계에서 500으로 죽지 않도록).
         """
         raw_text = _extract_source_text(crawl_result)
+        raw_text = _clean_and_truncate(raw_text)
 
         prompt = _PROMPT_TEMPLATE.format(raw_text=raw_text)
-
-        response_text = ""
-        try:
-            response = await self.client.aio.models.generate_content(
-                model=self.model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    max_output_tokens=1000,
-                    # JSON 형식 강제 → 마크다운 코드블록 없이 순수 JSON 응답
-                    response_mime_type="application/json",
-                ),
-            )
-            response_text = (response.text or "").strip()
-        except Exception as e:
-            logger.error("Gemini API 호출 실패: %s", e)
+        response_text = await self._call_gemini_with_retry(prompt)
 
         # JSON 파싱 (실패 시 로깅 후 빈 dict 처리)
         data: dict[str, Any] = {}
