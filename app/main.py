@@ -10,6 +10,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+from urllib.parse import quote
 
 import os
 from dotenv import load_dotenv
@@ -24,8 +25,6 @@ from app.crawler import crawl_meta
 from app.llm_analyzer import LLMAnalyzer
 from app.deeplink import generate_deeplinks
 from app.database import NotionDatabaseSaver # OK.노션적재클래스
-
-from app.models import ArchiveRequest
 
 # ── 로깅 ─────────────────────────────────────────────────
 logging.basicConfig(
@@ -115,10 +114,13 @@ async def root_handler() -> RedirectResponse | dict[str, str]:
 # ── [노션 파트] 1. 로그인 및 템플릿 선택 창 ──────────────────
 @app.get("/login")
 async def login_notion() -> RedirectResponse:
+
+    encoded_redirect_uri = quote(REDIRECT_URI)
+
     notion_auth_url = (
         f"https://api.notion.com/v1/oauth/authorize?"
         f"client_id={CLIENT_ID}&"
-        f"redirect_uri={REDIRECT_URI}&"
+        f"redirect_uri={encoded_redirect_uri}&"
         f"response_type=code&"
         f"owner=user"
     )
@@ -223,6 +225,7 @@ async def archive(req: ArchiveRequest, request: Request) -> ArchiveResponse:
     user_token = os.getenv("NOTION_TOKEN")
     user_database_id = os.getenv("NOTION_DATABASE_ID")
 
+    # ④ 노션 데이터베이스 최종 적재
     if not user_token or not user_database_id:
         logger.error("노션 토큰/데이터베이스 ID 미설정 → 적재 불가")
         raise HTTPException(
