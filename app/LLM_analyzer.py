@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -21,7 +20,7 @@ from google import genai
 from google.genai import types
 from pydantic import ValidationError
 
-from app.models import ActionCall, AnalysisResult
+from app.models import ActionCall, AnalysisResult, LLMExtraction
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +37,16 @@ genai_client = genai.Client(api_key=GEMINI_API_KEY)
 _MAX_INPUT_CHARS: Final = 4000  # 제미나이에 보내는 본문 최대 길이 (토큰 절약)
 _MIN_REQUEST_INTERVAL: Final = 2.0  # 연속 호출 사이 최소 간격(초) — 무료 플랜 RPM 방어
 _MAX_RETRIES: Final = 3
-_RETRY_BACKOFF_BASE: Final = 4.0  # 초. 429 발생 시 시도 횟수만큼 지수적으로 대기
+_RETRY_BACKOFF_BASE: Final = 3.0  # 초. 429 발생 시 시도 횟수만큼 지수적으로 대기
 
 # /archive 요청이 동시에 여러 건 들어와도 Gemini 호출은 이 락을 거쳐
 # 전역적으로 최소 간격을 지키도록 한다 (단순 for-loop sleep보다 견고함).
 _rate_limit_lock = asyncio.Lock()
 _last_call_ts: float = 0.0
+
+# 주 모델이 429/503 등으로 재시도까지 전부 실패하면 이 모델로 한 번 더
+# 시도한다. 에이전트 신뢰성(안 죽고 응답 주기)이 속도/최신성보다 우선.
+_FALLBACK_MODEL: Final = "gemini-2.5-flash"
 
 # ── 팀 공용 category 스펙 (models.py / deeplink.py / database.py와 동일해야 함) ──
 _VALID_CATEGORIES: Final = {"place", "event", "recipe", "tip", "other"}
@@ -69,28 +72,21 @@ _CATEGORY_ALIASES: Final = {
 }
 
 _PROMPT_TEMPLATE = """\
-아래 SNS 게시물 본문을 분석해서 정보를 추출해줘.
+아래 SNS 게시물 본문을 분석해서 정보를 추출해줘. (응답 형식은 별도로
+스키마로 강제되니, 여기서는 각 필드에 뭘 채울지만 신경 써줘.)
 
-category는 반드시 아래 5개 영어 값 중 하나로만 응답해 (한글 금지):
-- "place": 맛집/카페/술집/여행지 등 특정 장소·업체 소개
-- "event": 전시/공연/팝업스토어 등 날짜·기간이 있는 행사
-- "recipe": 요리 레시피
-- "tip": 장소 특정 없는 정보성 꿀팁
-- "other": 위 어디에도 해당 안 됨
-
-응답은 아래 JSON 형식으로만 해. 설명, 마크다운 코드블록 없이 순수 JSON만.
-본문에 없는 정보는 null로 채워.
-
-{{
-    "category": "place",
-    "summary": "한 줄 요약 (항상 필수로 채울 것)",
-    "place_name": "상호명 또는 null",
-    "region": "동/구 단위 지역명. 예: 연남동, 성수동. place일 때 지도 검색 정확도를 위해 본문/해시태그에서 최대한 추출. 없으면 null",
-    "address": "본문에 명시된 정확한 주소 또는 null",
-    "tags": ["해시태그", "키워드"],
-    "event_title": "일정 제목 또는 null (event일 때만)",
-    "event_date": "YYYY-MM-DD 형식 날짜 또는 null (event일 때, 본문에 날짜가 명시된 경우만)"
-}}
+- category는 다음 중 하나:
+  "place": 맛집/카페/술집/여행지 등 특정 장소·업체 소개
+  "event": 전시/공연/팝업스토어 등 날짜·기간이 있는 행사
+  "recipe": 요리 레시피
+  "tip": 장소 특정 없는 정보성 꿀팁
+  "other": 위 어디에도 해당 안 됨
+- summary는 한 줄 요약, 항상 채울 것
+- place_name / address / event_title / event_date는 본문에 실제로 명시된
+  경우만 채우고, 없으면 비워둬 (본문에 없는 값을 지어내지 마)
+- region은 동/구 단위 지역명 (예: 연남동, 성수동) — place일 때 지도 검색
+  정확도를 위해 본문/해시태그에서 최대한 추출
+- tags는 해시태그/키워드 목록
 
 [본문]
 {raw_text}
@@ -102,8 +98,9 @@ category는 반드시 아래 5개 영어 값 중 하나로만 응답해 (한글 
 _MAP_ACTION_DECL = types.FunctionDeclaration(
     name="create_map_deeplink",
     description=(
-        "장소(맛집/카페/술집/여행지 등) 정보가 있어서 지도 앱에서 바로 "
-        "검색해볼 수 있는 딥링크가 필요할 때 호출."
+        "장소명(place_name) 또는 주소(address) 중 하나라도 있으면 호출. "
+        "category가 'event'여도 장소 정보가 함께 있으면 호출한다 "
+        "(캘린더 액션과 동시에 호출될 수 있음 — 배타적이지 않음)."
     ),
     parameters={
         "type": "OBJECT",
@@ -123,7 +120,10 @@ _MAP_ACTION_DECL = types.FunctionDeclaration(
 
 _CALENDAR_ACTION_DECL = types.FunctionDeclaration(
     name="create_calendar_deeplink",
-    description="날짜/기간이 명시된 행사(전시/공연/팝업 등)라서 캘린더에 등록하면 좋을 때 호출.",
+    description=(
+        "event_title에 값이 있으면 호출. 장소 정보가 함께 있어서 "
+        "create_map_deeplink도 같이 호출되는 경우가 흔하다 (배타적이지 않음)."
+    ),
     parameters={
         "type": "OBJECT",
         "properties": {
@@ -160,12 +160,22 @@ _ACTION_TOOLS: Final = [
 ]
 
 _ACTION_PROMPT_TEMPLATE = """\
-아래는 SNS 게시물을 분석한 결과다. 이 정보를 참고해서 사용자에게 실제로
-도움이 될 액션을 0개 이상 선택해 함수 호출로 실행해줘.
+아래는 SNS 게시물을 분석한 결과다. category는 참고용일 뿐이니 그것만 보고
+액션을 하나만 고르지 마. 실제로는 각 필드가 채워져 있는지(데이터 존재
+여부)를 독립적으로 판단해서, 해당하는 액션을 전부 호출해줘.
 
-- 관련 없는 함수는 절대 호출하지 마 (예: 장소 정보 없는데 지도 함수 호출 금지)
-- 해당하는 함수가 여러 개면 전부 호출해도 됨
-- 애매하면 호출하지 말 것
+판단 기준 (서로 배타적이지 않음 — 둘 다 해당하면 둘 다 호출):
+- place_name 또는 address 중 하나라도 값이 있으면
+  → create_map_deeplink 호출
+  → category가 "event"여도 장소 정보가 있으면 반드시 호출한다
+    (예: 주소가 있는 팝업스토어/전시는 캘린더 + 지도 둘 다 필요)
+- event_title에 값이 있으면
+  → create_calendar_deeplink 호출 (event_date는 있으면 같이 넘기고 없으면 생략)
+- 위 두 조건에 모두 해당하지 않지만 저장해둘 만한 정보성 요약(summary)이 있으면
+  → create_memo_deeplink 호출
+
+- 값이 없는 필드를 근거로 삼아 호출하지 마
+- 조건에 안 맞으면 억지로 호출하지 말 것
 
 [분석 결과]
 {analysis_json}
@@ -295,15 +305,20 @@ class LLMAnalyzer:
     def __init__(self):
         self.client = genai_client
         self.model = "gemini-3.5-flash"
+        self.fallback_model = _FALLBACK_MODEL
 
     async def _call_gemini_raw(
-        self, prompt: str, config: types.GenerateContentConfig
+        self,
+        prompt: str,
+        config: types.GenerateContentConfig,
+        model: str | None = None,
     ) -> Any | None:
-        """전역 최소 호출 간격 + 429 재시도를 공통 처리하는 저수준 호출.
+        """전역 최소 호출 간격 + 429/503 재시도를 공통 처리하는 저수준 호출.
 
         text 응답(JSON 분석)과 function-calling 응답(액션 선택) 양쪽에서
         재사용한다. 실패 시 None을 반환 (호출부가 각자 폴백 처리)."""
         global _last_call_ts
+        target_model = model or self.model
 
         for attempt in range(1, _MAX_RETRIES + 1):
             # 여러 요청이 동시에 들어와도 Gemini 호출은 순차적으로,
@@ -316,40 +331,73 @@ class LLMAnalyzer:
 
             try:
                 return await self.client.aio.models.generate_content(
-                    model=self.model, contents=prompt, config=config,
+                    model=target_model, contents=prompt, config=config,
                 )
             except Exception as e:
                 if _is_retryable_error(e) and attempt < _MAX_RETRIES:
                     backoff = _RETRY_BACKOFF_BASE * attempt
                     logger.warning(
-                        "[%d/%d] Gemini 일시 오류(429/503) 감지 → %.1f초 대기 후 재시도: %s",
+                        "[%d/%d] Gemini(%s) 일시 오류(429/503) 감지 → %.1f초 대기 후 재시도: %s",
                         attempt,
                         _MAX_RETRIES,
+                        target_model,
                         backoff,
                         e,
                     )
                     await asyncio.sleep(backoff)
                     continue
-                logger.error("Gemini API 호출 실패: %s", e)
+                logger.error("Gemini(%s) API 호출 실패: %s", target_model, e)
                 return None
         return None
 
-    async def _call_gemini_with_retry(self, prompt: str) -> str:
-        """JSON 구조화 분석용 호출. 실패 시 빈 문자열 반환
-        (analyze()가 이후 폴백 로직으로 안전하게 처리하도록)."""
+    async def _call_gemini_with_fallback(
+        self, prompt: str, config: types.GenerateContentConfig
+    ) -> Any | None:
+        """주 모델(self.model)로 재시도까지 다 실패하면 폴백 모델로 한 번 더
+        전체 재시도 사이클을 시도한다. 에이전트가 완전히 죽지 않고 응답을
+        주는 것(신뢰성)이 최신 모델 사용보다 우선."""
+        response = await self._call_gemini_raw(prompt, config, model=self.model)
+        if response is not None:
+            return response
+
+        logger.warning(
+            "주 모델(%s) 전부 실패 → 폴백 모델(%s)로 전환", self.model, self.fallback_model
+        )
+        return await self._call_gemini_raw(prompt, config, model=self.fallback_model)
+
+    async def _extract_with_gemini(self, prompt: str) -> LLMExtraction | None:
+        """1차 분석 호출. response_schema=LLMExtraction으로 응답 구조를
+        Gemini API 레벨에서 강제한다.
+
+        - SDK가 스키마에 맞춰 이미 파싱해준 response.parsed를 우선 사용
+        - 혹시 parsed가 없으면 텍스트를 직접 스키마로 검증
+        - 둘 다 실패하면 None (analyze()가 안전하게 폴백 처리)
+        """
         config = types.GenerateContentConfig(
             temperature=0.0,
             max_output_tokens=2000,
-            # JSON 형식 강제 → 마크다운 코드블록 없이 순수 JSON 응답
             response_mime_type="application/json",
+            response_schema=LLMExtraction,
             # gemini-3.5-flash의 내부 reasoning(thinking) 토큰이
             # max_output_tokens 예산을 함께 소비해 응답이 잘리는 걸 방지
             thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
-        response = await self._call_gemini_raw(prompt, config)
+        response = await self._call_gemini_with_fallback(prompt, config)
         if response is None:
-            return ""
-        return (response.text or "").strip()
+            return None
+
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, LLMExtraction):
+            return parsed
+
+        text = (response.text or "").strip()
+        if not text:
+            return None
+        try:
+            return LLMExtraction.model_validate_json(text)
+        except ValidationError as e:
+            logger.warning("Gemini 응답이 스키마와 불일치 (response_schema 우회됨): %s", e)
+            return None
 
     async def _choose_actions(self, analysis: AnalysisResult) -> list[ActionCall]:
         """분석 결과를 바탕으로 LLM이 Function Calling으로 액션을 직접
@@ -370,7 +418,7 @@ class LLMAnalyzer:
                 function_calling_config=types.FunctionCallingConfig(mode="AUTO")
             ),
         )
-        response = await self._call_gemini_raw(prompt, config)
+        response = await self._call_gemini_with_fallback(prompt, config)
         if response is None or not response.candidates:
             return []
 
@@ -397,28 +445,27 @@ class LLMAnalyzer:
         raw_text = _clean_and_truncate(raw_text)
 
         prompt = _PROMPT_TEMPLATE.format(raw_text=raw_text)
-        response_text = await self._call_gemini_with_retry(prompt)
+        extraction = await self._extract_with_gemini(prompt)
 
-        # JSON 파싱 (실패 시 로깅 후 빈 dict 처리)
-        data: dict[str, Any] = {}
-        if response_text:
-            try:
-                data = json.loads(response_text)
-            except json.JSONDecodeError:
-                # 안전장치: 혹시 코드블록이 섞여 오면 제거 후 재시도
-                cleaned = response_text.strip("`").removeprefix("json").strip()
-                try:
-                    data = json.loads(cleaned)
-                except json.JSONDecodeError:
-                    logger.warning("Gemini 응답 JSON 파싱 실패: %s", response_text)
-
-        category = _normalize_category(data.get("category"))
-        summary = data.get("summary") or _fallback_summary(raw_text)
-        tags = _normalize_tags(data.get("tags"))
+        if extraction is not None:
+            category = _normalize_category(extraction.category)
+            summary = extraction.summary or _fallback_summary(raw_text)
+            tags = _normalize_tags(extraction.tags)
+            place_name = extraction.place_name or None
+            address = extraction.address or None
+            region = extraction.region or None
+            event_title = extraction.event_title or None
+            event_date = extraction.event_date or None
+        else:
+            logger.warning("Gemini 구조화 응답 획득 실패 → 안전 폴백으로 진행")
+            category = "other"
+            summary = _fallback_summary(raw_text)
+            tags = []
+            place_name = address = region = event_title = event_date = None
 
         # 안전장치: place_name/address는 뽑혔는데 category만 "other"로
         # 잘못 나온 경우 "place"로 보정 (Gemini의 카테고리 판단 실수 방어)
-        if category == "other" and (data.get("place_name") or data.get("address")):
+        if category == "other" and (place_name or address):
             logger.info("place_name/address 존재 → category를 'place'로 보정")
             category = "place"
 
@@ -426,11 +473,11 @@ class LLMAnalyzer:
             analysis_result = AnalysisResult(
                 category=category,
                 summary=summary,
-                place_name=data.get("place_name") or None,
-                address=data.get("address") or None,
-                region=data.get("region") or None,
-                event_title=data.get("event_title") or None,
-                event_date=data.get("event_date") or None,
+                place_name=place_name,
+                address=address,
+                region=region,
+                event_title=event_title,
+                event_date=event_date,
                 tags=tags,
             )
         except ValidationError as e:

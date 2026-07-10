@@ -24,6 +24,24 @@ class CrawlResult(BaseModel):
     raw_title: str = Field("", description="HTML <title> 태그 (있을 경우)")
 
 
+# ── LLM 1차 분석 스키마 (Gemini response_schema로 강제) ───
+class LLMExtraction(BaseModel):
+    """Gemini 1차 호출(본문 분석)에 강제하는 응답 스키마.
+
+    response_schema로 이 모델을 직접 넘기면 Gemini API가 이 구조를
+    스스로 지키도록 강제하므로, 수동 json.loads() + 코드블록 제거 같은
+    방어 로직 없이도 파싱 실패 가능성이 크게 줄어든다."""
+
+    category: str = Field(..., description="place | event | recipe | tip | other")
+    summary: str = Field(..., description="한 줄 요약")
+    place_name: str | None = Field(None, description="상호명 (본문에 없으면 null)")
+    region: str | None = Field(None, description="동/구 단위 지역명 (본문에 없으면 null)")
+    address: str | None = Field(None, description="정확한 주소 (본문에 없으면 null)")
+    tags: list[str] = Field(default_factory=list, description="해시태그 / 키워드")
+    event_title: str | None = Field(None, description="일정 제목 (event일 때만)")
+    event_date: str | None = Field(None, description="YYYY-MM-DD (event일 때만, 없으면 null)")
+
+
 # ── LLM 액션 선택 (Function Calling) ─────────────────────
 class ActionCall(BaseModel):
     """LLM이 Function Calling으로 직접 선택한 액션과 인자.
