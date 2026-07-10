@@ -21,7 +21,7 @@ from google import genai
 from google.genai import types
 from pydantic import ValidationError
 
-from app.models import AnalysisResult
+from app.models import ActionCall, AnalysisResult
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ genai_client = genai.Client(api_key=GEMINI_API_KEY)
 _MAX_INPUT_CHARS: Final = 4000  # 제미나이에 보내는 본문 최대 길이 (토큰 절약)
 _MIN_REQUEST_INTERVAL: Final = 2.0  # 연속 호출 사이 최소 간격(초) — 무료 플랜 RPM 방어
 _MAX_RETRIES: Final = 3
-_RETRY_BACKOFF_BASE: Final = 3.0  # 초. 429 발생 시 시도 횟수만큼 지수적으로 대기
+_RETRY_BACKOFF_BASE: Final = 4.0  # 초. 429 발생 시 시도 횟수만큼 지수적으로 대기
 
 # /archive 요청이 동시에 여러 건 들어와도 Gemini 호출은 이 락을 거쳐
 # 전역적으로 최소 간격을 지키도록 한다 (단순 for-loop sleep보다 견고함).
@@ -94,6 +94,81 @@ category는 반드시 아래 5개 영어 값 중 하나로만 응답해 (한글 
 
 [본문]
 {raw_text}
+"""
+
+# ── 액션 선택 (Function Calling) ─────────────────────────
+# 새 액션을 추가하고 싶으면 여기 함수 선언 하나 + deeplink.py의
+# _ACTION_BUILDERS에 매핑 하나만 추가하면 된다. category별 if/elif는 없다.
+_MAP_ACTION_DECL = types.FunctionDeclaration(
+    name="create_map_deeplink",
+    description=(
+        "장소(맛집/카페/술집/여행지 등) 정보가 있어서 지도 앱에서 바로 "
+        "검색해볼 수 있는 딥링크가 필요할 때 호출."
+    ),
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "query": {
+                "type": "STRING",
+                "description": (
+                    "지도 검색에 쓸 쿼리. 주소와 상호명을 조합해서 만들어줘 "
+                    "(예: '마포구 희우정로20길 70 온리디스베이커리'). "
+                    "주소가 없으면 상호명+지역명만이라도 조합."
+                ),
+            }
+        },
+        "required": ["query"],
+    },
+)
+
+_CALENDAR_ACTION_DECL = types.FunctionDeclaration(
+    name="create_calendar_deeplink",
+    description="날짜/기간이 명시된 행사(전시/공연/팝업 등)라서 캘린더에 등록하면 좋을 때 호출.",
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "event_title": {"type": "STRING", "description": "캘린더에 등록할 일정 제목"},
+            "event_date": {
+                "type": "STRING",
+                "description": "YYYY-MM-DD 형식 날짜. 본문에 명시 안 됐으면 생략.",
+            },
+        },
+        "required": ["event_title"],
+    },
+)
+
+_MEMO_ACTION_DECL = types.FunctionDeclaration(
+    name="create_memo_deeplink",
+    description="장소/일정과 무관한 정보성 콘텐츠(레시피, 꿀팁 등)라서 메모 앱에 저장해두면 좋을 때 호출.",
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "text": {"type": "STRING", "description": "메모에 저장할 핵심 요약 텍스트"},
+        },
+        "required": ["text"],
+    },
+)
+
+_ACTION_TOOLS: Final = [
+    types.Tool(
+        function_declarations=[
+            _MAP_ACTION_DECL,
+            _CALENDAR_ACTION_DECL,
+            _MEMO_ACTION_DECL,
+        ]
+    )
+]
+
+_ACTION_PROMPT_TEMPLATE = """\
+아래는 SNS 게시물을 분석한 결과다. 이 정보를 참고해서 사용자에게 실제로
+도움이 될 액션을 0개 이상 선택해 함수 호출로 실행해줘.
+
+- 관련 없는 함수는 절대 호출하지 마 (예: 장소 정보 없는데 지도 함수 호출 금지)
+- 해당하는 함수가 여러 개면 전부 호출해도 됨
+- 애매하면 호출하지 말 것
+
+[분석 결과]
+{analysis_json}
 """
 
 
@@ -199,14 +274,20 @@ def _clean_and_truncate(
     return f"{head}{marker}{tail}" if tail else head
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
-    """429 / RESOURCE_EXHAUSTED 계열 에러인지 판별."""
+def _is_retryable_error(exc: Exception) -> bool:
+    """일시적으로 재시도하면 나아질 가능성이 있는 에러인지 판별.
+
+    - 429 / RESOURCE_EXHAUSTED / quota: rate limit
+    - 503 / UNAVAILABLE: 모델 과부하 (일시적 현상, 재시도하면 대부분 해결됨)
+    """
     text = str(exc)
     return (
         "429" in text
         or "RESOURCE_EXHAUSTED" in text
         or "rate limit" in text.lower()
         or "quota" in text.lower()
+        or "503" in text
+        or "UNAVAILABLE" in text
     )
 
 
@@ -215,13 +296,13 @@ class LLMAnalyzer:
         self.client = genai_client
         self.model = "gemini-3.5-flash"
 
-    async def _call_gemini_with_retry(self, prompt: str) -> str:
-        """전역 최소 호출 간격을 지키며 Gemini를 호출하고,
-        429(rate limit)가 뜨면 지수 백오프로 재시도한다.
+    async def _call_gemini_raw(
+        self, prompt: str, config: types.GenerateContentConfig
+    ) -> Any | None:
+        """전역 최소 호출 간격 + 429 재시도를 공통 처리하는 저수준 호출.
 
-        모든 시도가 실패해도 예외를 던지지 않고 빈 문자열을 반환한다
-        (analyze()가 이후 폴백 로직으로 안전하게 처리하도록).
-        """
+        text 응답(JSON 분석)과 function-calling 응답(액션 선택) 양쪽에서
+        재사용한다. 실패 시 None을 반환 (호출부가 각자 폴백 처리)."""
         global _last_call_ts
 
         for attempt in range(1, _MAX_RETRIES + 1):
@@ -234,35 +315,76 @@ class LLMAnalyzer:
                 _last_call_ts = time.monotonic()
 
             try:
-                response = await self.client.aio.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.0,
-                        max_output_tokens=2000,
-                        # JSON 형식 강제 → 마크다운 코드블록 없이 순수 JSON 응답
-                        response_mime_type="application/json",
-                        # gemini-3.5-flash는 기본적으로 내부 reasoning(thinking) 토큰을
-                        # max_output_tokens 예산에서 함께 소비한다. thinking_budget=0으로
-                        # 꺼주지 않으면 실제 JSON 출력분이 부족해져 응답이 중간에 잘린다.
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    ),
+                return await self.client.aio.models.generate_content(
+                    model=self.model, contents=prompt, config=config,
                 )
-                return (response.text or "").strip()
             except Exception as e:
-                if _is_rate_limit_error(e) and attempt < _MAX_RETRIES:
+                if _is_retryable_error(e) and attempt < _MAX_RETRIES:
                     backoff = _RETRY_BACKOFF_BASE * attempt
                     logger.warning(
-                        "[%d/%d] Gemini 429(rate limit) 감지 → %.1f초 대기 후 재시도",
+                        "[%d/%d] Gemini 일시 오류(429/503) 감지 → %.1f초 대기 후 재시도: %s",
                         attempt,
                         _MAX_RETRIES,
                         backoff,
+                        e,
                     )
                     await asyncio.sleep(backoff)
                     continue
                 logger.error("Gemini API 호출 실패: %s", e)
-                return ""
-        return ""
+                return None
+        return None
+
+    async def _call_gemini_with_retry(self, prompt: str) -> str:
+        """JSON 구조화 분석용 호출. 실패 시 빈 문자열 반환
+        (analyze()가 이후 폴백 로직으로 안전하게 처리하도록)."""
+        config = types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=2000,
+            # JSON 형식 강제 → 마크다운 코드블록 없이 순수 JSON 응답
+            response_mime_type="application/json",
+            # gemini-3.5-flash의 내부 reasoning(thinking) 토큰이
+            # max_output_tokens 예산을 함께 소비해 응답이 잘리는 걸 방지
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
+        response = await self._call_gemini_raw(prompt, config)
+        if response is None:
+            return ""
+        return (response.text or "").strip()
+
+    async def _choose_actions(self, analysis: AnalysisResult) -> list[ActionCall]:
+        """분석 결과를 바탕으로 LLM이 Function Calling으로 액션을 직접
+        선택하게 한다. category별 if/elif 분기 없이, 모델이 호출한 함수
+        이름 + 인자를 그대로 ActionCall로 담아 반환한다.
+
+        실패하거나 아무 함수도 호출하지 않으면 빈 리스트를 반환한다.
+        """
+        analysis_json = analysis.model_dump_json(exclude={"actions"})
+        prompt = _ACTION_PROMPT_TEMPLATE.format(analysis_json=analysis_json)
+
+        config = types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=500,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            tools=_ACTION_TOOLS,
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="AUTO")
+            ),
+        )
+        response = await self._call_gemini_raw(prompt, config)
+        if response is None or not response.candidates:
+            return []
+
+        actions: list[ActionCall] = []
+        parts = response.candidates[0].content.parts or []
+        for part in parts:
+            fc = getattr(part, "function_call", None)
+            if fc is None:
+                continue
+            args = dict(fc.args) if fc.args else {}
+            actions.append(ActionCall(action=fc.name, args=args))
+            logger.info("LLM이 액션 선택: %s(%s)", fc.name, args)
+
+        return actions
 
     async def analyze(self, crawl_result: Any) -> AnalysisResult:
         """크롤링 결과를 Gemini로 분석해 AnalysisResult로 반환.
@@ -316,10 +438,17 @@ class LLMAnalyzer:
             logger.error("AnalysisResult 검증 실패, 폴백 처리: %s", e)
             analysis_result = AnalysisResult(category="other", summary=_fallback_summary(raw_text))
 
+        # 액션 선택 (Function Calling) — 실패해도 파이프라인은 계속 진행
+        try:
+            analysis_result.actions = await self._choose_actions(analysis_result)
+        except Exception as e:
+            logger.warning("액션 선택 실패, 액션 없이 진행: %s", e)
+
         logger.info(
-            "LLM 분석 완료: category=%s, place_name=%s, region=%s",
+            "LLM 분석 완료: category=%s, place_name=%s, region=%s, actions=%s",
             analysis_result.category,
             analysis_result.place_name,
             analysis_result.region,
+            [a.action for a in analysis_result.actions],
         )
         return analysis_result

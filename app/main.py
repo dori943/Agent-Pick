@@ -25,6 +25,12 @@ from app.llm_analyzer import LLMAnalyzer
 from app.deeplink import generate_deeplinks
 from app.database import NotionDatabaseSaver # OK.노션적재클래스
 
+from app.models import ArchiveRequest
+
+print("★ models.py 위치:", ArchiveRequest.__module__, ArchiveRequest.model_fields.keys())
+import app.models as _m
+print("★ 실제 파일 경로:", _m.__file__)
+
 # ── 로깅 ─────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,

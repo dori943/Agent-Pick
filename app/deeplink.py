@@ -1,80 +1,95 @@
-"""AnalysisResult로부터 각종 딥링크 생성."""
+"""LLM이 Function Calling으로 선택한 actions를 실제 딥링크 문자열로 실행.
+
+기존에는 category별 if/elif로 딥링크 종류를 코드가 미리 정해뒀지만,
+지금은 llm_analyzer.py에서 LLM이 직접 어떤 함수를 어떤 인자로 호출할지
+고른 AnalysisResult.actions를 그대로 실행만 한다.
+
+새 액션을 추가하려면:
+  1) llm_analyzer.py에 함수 선언(FunctionDeclaration) 추가
+  2) 아래 _ACTION_BUILDERS에 "함수명" -> (DeeplinkResult 필드명, 빌더) 매핑 추가
+이 두 곳 외에는 코드를 건드릴 필요가 없다.
+"""
 from __future__ import annotations
 
 import logging
+from typing import Callable
 from urllib.parse import quote
 
-import httpx
-
-from app.models import AnalysisResult, DeeplinkResult
+from app.models import ActionCall, AnalysisResult, DeeplinkResult
 from app.naver_map import build_nmap_search_deeplink
 
 logger = logging.getLogger(__name__)
 
 
-async def _build_map_deeplink(
-    analysis: AnalysisResult,
-    client: httpx.AsyncClient,
-) -> str | None:
-    """place 카테고리에 대한 지도 딥링크 생성.
-
-    네이버 지역 검색 API(NAVER_CLIENT_ID/SECRET 키 필요) 없이도 동작하도록,
-    지번주소/상호명 중 있는 값만 조합해 nmap://search로 바로 검색 결과가
-    뜨도록 한다 (키 발급 불필요).
-      - 주소만 있으면 주소만
-      - 상호명만 있으면 상호명만
-      - 둘 다 있으면 둘을 조합해 검색 정확도를 높인다
-    """
-    if analysis.category != "place":
+def _build_map_link(args: dict) -> str | None:
+    query = args.get("query")
+    if not query:
         return None
-
-    name = analysis.place_name
-    address = analysis.address
-
-    if not name and not address:
-        # 검색어로 쓸 정보가 아무것도 없음
-        return None
-
-    # 좌표 정보 없이, 있는 정보(주소/상호명)만 조합해 검색 딥링크로 생성
-    query_parts = [p for p in (address, name) if p]
-    query = " ".join(query_parts)
     return build_nmap_search_deeplink(query)
 
 
-def _build_calendar_deeplink(analysis: AnalysisResult) -> str | None:
-    """event 카테고리에 대한 캘린더 딥링크 (간단 버전)."""
-    if analysis.category != "event" or not analysis.event_title:
+def _build_calendar_link(args: dict) -> str | None:
+    event_title = args.get("event_title")
+    if not event_title:
         return None
-    # 필요 시 확장. 지금은 제목만 담은 폴백 형태.
-    title = quote(analysis.event_title)
-    return f"calshow://?title={title}"
+    return f"calshow://?title={quote(event_title)}"
 
 
-def _build_memo_deeplink(analysis: AnalysisResult) -> str | None:
-    """요약을 메모 앱으로 넘기는 딥링크 (폴백)."""
-    if not analysis.summary:
+def _build_memo_link(args: dict) -> str | None:
+    text = args.get("text")
+    if not text:
         return None
-    return f"mobilenotes://new?text={quote(analysis.summary)}"
+    return f"mobilenotes://new?text={quote(text)}"
 
 
-async def generate_deeplinks(
-    analysis_result: AnalysisResult,
-    client: httpx.AsyncClient | None = None,
-) -> DeeplinkResult:
-    """AnalysisResult → DeeplinkResult 변환 진입점."""
-    # client가 주입되지 않으면 내부에서 생성
-    own_client = client is None
-    if own_client:
-        client = httpx.AsyncClient(timeout=10.0)
+# 함수명(LLM이 호출한 이름) -> (DeeplinkResult 필드명, 빌더 함수)
+_ACTION_BUILDERS: dict[str, tuple[str, Callable[[dict], str | None]]] = {
+    "create_map_deeplink": ("map_deeplink", _build_map_link),
+    "create_calendar_deeplink": ("calendar_deeplink", _build_calendar_link),
+    "create_memo_deeplink": ("memo_deeplink", _build_memo_link),
+}
 
+
+def _execute_action(action: ActionCall) -> tuple[str, str] | None:
+    """ActionCall 하나를 실제로 실행해 (필드명, 딥링크) 튜플로 반환.
+
+    등록되지 않은 함수명이거나 필수 인자가 없으면 None."""
+    entry = _ACTION_BUILDERS.get(action.action)
+    if entry is None:
+        logger.warning("알 수 없는 액션 무시: %s", action.action)
+        return None
+
+    field_name, builder = entry
     try:
-        map_link = await _build_map_deeplink(analysis_result, client)
-    finally:
-        if own_client:
-            await client.aclose()
+        link = builder(action.args)
+    except Exception as e:
+        logger.warning("액션 실행 실패 (%s, args=%s): %s", action.action, action.args, e)
+        return None
 
-    return DeeplinkResult(
-        map_deeplink=map_link,
-        calendar_deeplink=_build_calendar_deeplink(analysis_result),
-        memo_deeplink=_build_memo_deeplink(analysis_result),
-    )
+    if not link:
+        logger.warning("액션 %s 실행 결과 없음 (필수 인자 누락): %s", action.action, action.args)
+        return None
+
+    return field_name, link
+
+
+async def generate_deeplinks(analysis_result: AnalysisResult) -> DeeplinkResult:
+    """AnalysisResult.actions(LLM이 선택한 함수 호출들)를 실제 딥링크로 실행.
+
+    category를 다시 들여다보지 않는다 — LLM이 이미 필요한 액션을
+    골라뒀으므로, 여기서는 그 결과를 그대로 실행하기만 한다.
+    """
+    result: dict[str, str | None] = {
+        "map_deeplink": None,
+        "calendar_deeplink": None,
+        "memo_deeplink": None,
+    }
+
+    for action in analysis_result.actions:
+        executed = _execute_action(action)
+        if executed is None:
+            continue
+        field_name, link = executed
+        result[field_name] = link
+
+    return DeeplinkResult(**result)
