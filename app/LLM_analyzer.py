@@ -16,11 +16,13 @@ import re
 import time
 from typing import Any, Final
 
+import httpx
 from google import genai
 from google.genai import types
 from pydantic import ValidationError
 
 from app.models import ActionCall, AnalysisResult, LLMExtraction
+from app.naver_map import search_place
 
 logger = logging.getLogger(__name__)
 
@@ -434,7 +436,45 @@ class LLMAnalyzer:
 
         return actions
 
-    async def analyze(self, crawl_result: Any) -> AnalysisResult:
+    async def _enrich_place_address(
+        self, analysis: AnalysisResult, client: httpx.AsyncClient | None
+    ) -> None:
+        """category=place인데 상호명은 있고 주소가 없는 경우, 네이버 지역
+        검색으로 주소를 보완한다 (제자리에서 analysis를 직접 수정).
+
+        - NAVER_CLIENT_ID/SECRET 미설정, 검색 실패, 매칭 실패 등 어떤
+          이유로든 보완에 실패해도 예외를 던지지 않고 조용히 건너뛴다
+          (보완은 "있으면 좋은" 단계지 필수 단계가 아님).
+        - httpx client가 없으면(단독 호출 등) 아예 시도하지 않는다.
+        """
+        if analysis.category != "place" or not analysis.place_name or analysis.address:
+            return
+        if client is None:
+            logger.info("httpx client 미제공 → 주소 보완 스킵")
+            return
+
+        try:
+            item = await search_place(analysis.place_name, analysis.region, client)
+        except RuntimeError:
+            logger.info("NAVER_CLIENT_ID/SECRET 미설정 → 주소 보완 스킵")
+            return
+        except Exception as e:
+            logger.warning("네이버 지역 검색 실패, 주소 보완 없이 진행: %s", e)
+            return
+
+        if not item:
+            logger.info("네이버 검색에서 '%s' 매칭 실패 → 주소 보완 없음", analysis.place_name)
+            return
+
+        address = item.get("roadAddress") or item.get("address")
+        if address:
+            analysis.address = address
+            logger.info("네이버 지역 검색으로 주소 보완 완료: %s", address)
+
+
+    async def analyze(
+        self, crawl_result: Any, client: httpx.AsyncClient | None = None
+    ) -> AnalysisResult:
         """크롤링 결과를 Gemini로 분석해 AnalysisResult로 반환.
 
         Gemini 호출/파싱/검증 중 어느 단계가 실패하더라도 예외를 던지지
@@ -484,6 +524,13 @@ class LLMAnalyzer:
             # 스펙 불일치로 인한 크래시 방지: 최소 필드만으로 안전하게 폴백
             logger.error("AnalysisResult 검증 실패, 폴백 처리: %s", e)
             analysis_result = AnalysisResult(category="other", summary=_fallback_summary(raw_text))
+
+        # 주소 보완: place인데 상호명만 있고 주소가 없으면 네이버 지역
+        # 검색으로 보완한 뒤 액션 선택에 반영 (지도 딥링크 정확도 개선)
+        try:
+            await self._enrich_place_address(analysis_result, client)
+        except Exception as e:
+            logger.warning("주소 보완 단계 실패, 보완 없이 진행: %s", e)
 
         # 액션 선택 (Function Calling) — 실패해도 파이프라인은 계속 진행
         try:

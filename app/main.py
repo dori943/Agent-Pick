@@ -27,10 +27,6 @@ from app.database import NotionDatabaseSaver # OK.노션적재클래스
 
 from app.models import ArchiveRequest
 
-print("★ models.py 위치:", ArchiveRequest.__module__, ArchiveRequest.model_fields.keys())
-import app.models as _m
-print("★ 실제 파일 경로:", _m.__file__)
-
 # ── 로깅 ─────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -97,9 +93,28 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# ── 메인 페이지 접속 시 토큰 유무에 따라 자동 리다이렉트 제어 ──
+@app.get("/", response_model=None)
+async def root_handler() -> RedirectResponse | dict[str, str]:
+    # 1. 환경 변수에서 토큰과 DB ID가 이미 저장되어 있는지 확인합니다.
+    user_token = os.getenv("NOTION_TOKEN")
+    user_database_id = os.getenv("NOTION_DATABASE_ID")
+
+    # 2. 둘 중 하나라도 없다면 연동이 안 된 '첫 시도' 상태이므로 /login으로 토스합니다.
+    if not user_token or not user_database_id:
+        logger.info("❌ 노션 연동 정보 없음 (첫 시도) ➡️ 자동으로 /login 화면으로 이동합니다.")
+        return RedirectResponse(url="/login")
+    
+    # 3. 이미 토큰이 존재한다면 굳이 연동창을 띄우지 않고 안내 메시지를 보여줍니다.
+    logger.info("✅ 이미 노션 연동 정보가 존재합니다. 리다이렉트를 건너뜁니다.")
+    return {
+        "status": "Already Authenticated",
+        "message": "이미 노션 연동이 완료된 상태입니다. /archive 엔드포인트를 사용해 아카이빙을 진행하세요!"
+    }
+
+# ── [노션 파트] 1. 로그인 및 템플릿 선택 창 ──────────────────
 @app.get("/login")
 async def login_notion() -> RedirectResponse:
-    """사용자가 접속하면 노션 OAuth 인증 페이지로 자동 리다이렉트합니다."""
     notion_auth_url = (
         f"https://api.notion.com/v1/oauth/authorize?"
         f"client_id={CLIENT_ID}&"
@@ -110,8 +125,7 @@ async def login_notion() -> RedirectResponse:
     logger.info("사용자를 노션 OAuth 로그인 화면으로 이동시킵니다.")
     return RedirectResponse(url=notion_auth_url)
 
-
-
+# ── [노션 파트] 2. 토큰 교환 및 로컬 .env 저장 ──
 @app.get("/callback")
 async def notion_callback(code: str | None = None, error: str | None = None) -> dict[str, str]:
     """노션이 던져준 임시 code를 낚아채서 사용자의 진짜 Access Token과 교환합니다."""
@@ -151,14 +165,27 @@ async def notion_callback(code: str | None = None, error: str | None = None) -> 
     
     user_database_id = token_data.get("duplicated_template_id")
 
-    logger.info("노션 로그인 및 데이터베이스 연동이 성공적으로 완료되었습니다!")
-    
+    # ◀ 1인용 프로그램이므로 받아온 토큰 정보를 서버 컴퓨터의 .env 파일에 즉시 기록합니다.
+    try:
+        with open(".env", "a", encoding="utf-8") as f:
+            f.write(f"\nNOTION_TOKEN={user_access_token}")
+            f.write(f"\nNOTION_DATABASE_ID={user_database_id}")
+        
+        # ◀ 파일 저장 후, 현재 켜져 있는 서버 메모리(환경 변수)에도 즉시 동기화해 줍니다.
+        os.environ["NOTION_TOKEN"] = str(user_access_token)
+        os.environ["NOTION_DATABASE_ID"] = str(user_database_id)
+        
+        logger.info("로컬 .env 파일에 노션 인증 정보 저장 완료")
+    except Exception as e:
+        logger.error("로컬 파일 기록 실패: %s", str(e))
+        raise HTTPException(status_code=500, detail="로컬 .env 파일에 토큰을 저장하지 못했습니다.")
+
+    # ◀ 브라우저 화면에 날 토큰을 노출하지 않고 깔끔한 성공 메시지만 보여줍니다.
     return {
         "status": "Authentication Successful",
-        "message": "이제 스마트폰 단축어를 사용해 서비스를 이용하실 수 있습니다!",
-        "database_id": str(user_database_id),
-        "access_token":str(user_access_token)
+        "message": "노션 연동이 완전히 끝났습니다!"
     }
+
 
 
 # ── 핵심 엔드포인트 ──────────────────────────────────────
@@ -188,7 +215,7 @@ async def archive(req: ArchiveRequest, request: Request) -> ArchiveResponse:
 
     # ② LLM 분석
     llm_analyzer = LLMAnalyzer()
-    analysis_result = await llm_analyzer.analyze(crawl_result)
+    analysis_result = await llm_analyzer.analyze(crawl_result, client=client)
 
     # ③ 딥링크 생성
     deeplink_result = await generate_deeplinks(analysis_result)
