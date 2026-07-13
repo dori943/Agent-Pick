@@ -172,24 +172,22 @@ class NotionDatabaseSaver:
             },
         }
 
-        # Conditional properties: only attached when relevant to the category.
-        if category == "place":
-            address = analysis_data.get("address")
-            map_deeplink = deeplink_data.get("map_deeplink")
+        address = analysis_data.get("address")
+        map_deeplink = deeplink_data.get("map_deeplink")
 
-            if address:
-                properties["address"] = {
-                    "rich_text": [
-                        {"text": {"content": address}}
-                    ]
-                }
+        if address:
+            properties["address"] = {
+                "rich_text": [
+                    {"text": {"content": address}}
+                ]
+            }
 
-            if map_deeplink:
-                properties["map_deeplink"] = {
-                    "url": map_deeplink
-                }
+        if map_deeplink:
+            properties["map_deeplink"] = {
+                "url": map_deeplink
+            }
 
-        elif category == "event":
+        if category == "event":
             event_date = analysis_data.get("event_date")
 
             if event_date:
