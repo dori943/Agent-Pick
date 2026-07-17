@@ -24,6 +24,36 @@ class CrawlResult(BaseModel):
     raw_title: str = Field("", description="HTML <title> 태그 (있을 경우)")
 
 
+# ── LLM 1차 분석 스키마 (Gemini response_schema로 강제) ───
+class LLMExtraction(BaseModel):
+    """Gemini 1차 호출(본문 분석)에 강제하는 응답 스키마.
+
+    response_schema로 이 모델을 직접 넘기면 Gemini API가 이 구조를
+    스스로 지키도록 강제하므로, 수동 json.loads() + 코드블록 제거 같은
+    방어 로직 없이도 파싱 실패 가능성이 크게 줄어든다."""
+
+    category: str = Field(..., description="place | event | recipe | tip | other")
+    summary: str = Field(..., description="한 줄 요약")
+    place_name: str | None = Field(None, description="상호명 (본문에 없으면 null)")
+    region: str | None = Field(None, description="동/구 단위 지역명 (본문에 없으면 null)")
+    address: str | None = Field(None, description="정확한 주소 (본문에 없으면 null)")
+    tags: list[str] = Field(default_factory=list, description="해시태그 / 키워드")
+    event_title: str | None = Field(None, description="일정 제목 (event일 때만)")
+    event_date: str | None = Field(None, description="YYYY-MM-DD (event일 때만, 없으면 null)")
+
+
+# ── LLM 액션 선택 (Function Calling) ─────────────────────
+class ActionCall(BaseModel):
+    """LLM이 Function Calling으로 직접 선택한 액션과 인자.
+
+    action: Gemini에 등록된 함수 선언 이름과 동일해야 한다
+            (예: "create_map_deeplink").
+    args:   해당 함수의 파라미터 dict (예: {"query": "..."})."""
+
+    action: str
+    args: dict = Field(default_factory=dict)
+
+
 # ── LLM 분석 결과 ────────────────────────────────────────
 class AnalysisResult(BaseModel):
     """LLM이 반환하는 구조화된 분석 결과."""
@@ -31,14 +61,17 @@ class AnalysisResult(BaseModel):
     category: str = Field(
         ..., description="콘텐츠 카테고리 (place | event | recipe | tip | other)"
     )
-    summary: str = Field(..., description="한 줄 요약")
+    summary: str = Field("", description="한 줄 요약 (LLM 실패 시에도 빈 문자열로 안전하게 처리)")
     place_name: str | None = Field(None, description="장소명 (place일 때)")
     address: str | None = Field(None, description="주소 (place일 때)")
-    latitude: float | None = Field(None, description="위도")
-    longitude: float | None = Field(None, description="경도")
     event_title: str | None = Field(None, description="일정 제목 (event일 때)")
     event_date: str | None = Field(None, description="ISO-8601 날짜 (event일 때)")
     tags: list[str] = Field(default_factory=list, description="해시태그 / 키워드")
+    region: str | None = Field(None, description="지역명 (예: 연남동) — 네이버 매칭 대조용")
+    actions: list[ActionCall] = Field(
+        default_factory=list,
+        description="LLM이 Function Calling으로 직접 선택한 실행할 액션 목록",
+    )
 
 
 # ── 딥링크 ───────────────────────────────────────────────
