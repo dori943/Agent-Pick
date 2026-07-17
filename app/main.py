@@ -222,33 +222,33 @@ async def archive(req: ArchiveRequest, request: Request) -> ArchiveResponse:
     # ③ 딥링크 생성
     deeplink_result = await generate_deeplinks(analysis_result)
 
-    user_token = os.getenv("NOTION_TOKEN")
-    user_database_id = os.getenv("NOTION_DATABASE_ID")
+    #user_token = os.getenv("NOTION_TOKEN")
+    # user_database_id = os.getenv("NOTION_DATABASE_ID")
 
-    # ④ 노션 데이터베이스 최종 적재
-    if not user_token or not user_database_id:
-        logger.error("노션 토큰/데이터베이스 ID 미설정 → 적재 불가")
-        raise HTTPException(
-            status_code=401,
-            detail="노션 연동 정보가 없습니다. /login으로 먼저 노션 계정을 연동해주세요.",
-        )
+    # # ④ 노션 데이터베이스 최종 적재
+    # if not user_token or not user_database_id:
+    #     logger.error("노션 토큰/데이터베이스 ID 미설정 → 적재 불가")
+    #     raise HTTPException(
+    #         status_code=401,
+    #         detail="노션 연동 정보가 없습니다. /login으로 먼저 노션 계정을 연동해주세요.",
+    #     )
 
-    logger.info("▶ 노션 데이터베이스 최종 적재 시작 (Target DB ID: %s)", user_database_id)
+    # logger.info("▶ 노션 데이터베이스 최종 적재 시작 (Target DB ID: %s)", user_database_id)
 
-    try:
-        saver = NotionDatabaseSaver(notion_token=user_token, database_id=user_database_id)
-    except ValueError as e:
-        logger.error("노션 클라이언트 초기화 실패: %s", e)
-        raise HTTPException(status_code=400, detail=f"노션 연동 정보가 올바르지 않습니다: {e}")
+    # try:
+    #     saver = NotionDatabaseSaver(notion_token=user_token, database_id=user_database_id)
+    # except ValueError as e:
+    #     logger.error("노션 클라이언트 초기화 실패: %s", e)
+    #     raise HTTPException(status_code=400, detail=f"노션 연동 정보가 올바르지 않습니다: {e}")
 
-    notion_success = saver.save_archive(
-        crawl_data=crawl_result.model_dump(),
-        analysis_data=analysis_result.model_dump(),
-        deeplink_data=deeplink_result.model_dump() if deeplink_result else {}
-    )
+    # notion_success = saver.save_archive(
+    #     crawl_data=crawl_result.model_dump(),
+    #     analysis_data=analysis_result.model_dump(),
+    #     deeplink_data=deeplink_result.model_dump() if deeplink_result else {}
+    # )
 
-    if not notion_success:
-        logger.error("❌ 노션 데이터베이스 데이터 보존 작업 중 크리티컬 실패 발생")
+    # if not notion_success:
+    #     logger.error("❌ 노션 데이터베이스 데이터 보존 작업 중 크리티컬 실패 발생")
 
     elapsed = time.perf_counter() - t0
     logger.info("✔ 파이프라인 완료 (%.2fs): category=%s", elapsed, analysis_result.category)

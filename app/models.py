@@ -34,6 +34,13 @@ class LLMExtraction(BaseModel):
 
     category: str = Field(..., description="place | event | recipe | tip | other")
     summary: str = Field(..., description="한 줄 요약")
+    memo_body: str = Field(
+        "",
+        description=(
+            "메모 앱에 그대로 저장할 본문. 첫 줄=제목, 둘째 줄부터=내용. "
+            "SNS 메타데이터·홍보문구를 걷어내고 정리한 결과. 저장할 게 없으면 빈 문자열"
+        ),
+    )
     place_name: str | None = Field(None, description="상호명 (본문에 없으면 null)")
     region: str | None = Field(None, description="동/구 단위 지역명 (본문에 없으면 null)")
     address: str | None = Field(None, description="정확한 주소 (본문에 없으면 null)")
@@ -62,6 +69,7 @@ class AnalysisResult(BaseModel):
         ..., description="콘텐츠 카테고리 (place | event | recipe | tip | other)"
     )
     summary: str = Field("", description="한 줄 요약 (LLM 실패 시에도 빈 문자열로 안전하게 처리)")
+    memo_body: str = Field("", description="LLM이 정제한 메모 본문 (첫 줄=제목). 없으면 빈 문자열")
     place_name: str | None = Field(None, description="장소명 (place일 때)")
     address: str | None = Field(None, description="주소 (place일 때)")
     event_title: str | None = Field(None, description="일정 제목 (event일 때)")
@@ -76,11 +84,20 @@ class AnalysisResult(BaseModel):
 
 # ── 딥링크 ───────────────────────────────────────────────
 class DeeplinkResult(BaseModel):
-    """딥링크 생성 모듈의 반환값."""
+    """딥링크/액션 페이로드 생성 모듈의 반환값.
+
+    메모만 URL이 아니라 텍스트인 이유: Apple 메모에는 본문을 채우는 공개
+    URL 스킴이 없다(mobilenotes://는 비공개 스킴이라 노트를 저장하지 않음).
+    대신 클라이언트인 단축어에 네이티브 '메모 생성' 액션이 있고 온디바이스라
+    URL 길이·인코딩·개행 제약이 전혀 없다. 그래서 서버는 텍스트를 그대로
+    내려주고 단축어가 그걸 본문 칸에 꽂는다.
+    """
 
     map_deeplink: str | None = Field(None, description="지도 앱 딥링크")
     calendar_deeplink: str | None = Field(None, description="캘린더 딥링크")
-    memo_deeplink: str | None = Field(None, description="메모/노트 딥링크")
+    memo_text: str | None = Field(
+        None, description="메모 앱에 그대로 넣을 본문 (단축어의 '메모 생성' 액션이 사용)"
+    )
 
 
 # ── Final Response ───────────────────────────────────────

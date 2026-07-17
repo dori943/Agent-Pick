@@ -48,7 +48,7 @@ _last_call_ts: float = 0.0
 
 # 주 모델이 429/503 등으로 재시도까지 전부 실패하면 이 모델로 한 번 더
 # 시도한다. 에이전트 신뢰성(안 죽고 응답 주기)이 속도/최신성보다 우선.
-_FALLBACK_MODEL: Final = "gemini-3.1-flash-lite"
+_FALLBACK_MODEL: Final = "gemini-3.5-flash"
 
 # ── 팀 공용 category 스펙 (models.py / deeplink.py / database.py와 동일해야 함) ──
 _VALID_CATEGORIES: Final = {"place", "event", "recipe", "tip", "other"}
@@ -84,6 +84,19 @@ _PROMPT_TEMPLATE = """\
   "tip": 장소 특정 없는 정보성 꿀팁
   "other": 위 어디에도 해당 안 됨
 - summary는 한 줄 요약, 항상 채울 것
+- memo_body는 메모 앱에 그대로 저장할 본문. 저장할 가치가 있는 정보성
+  콘텐츠일 때만 채우고(주로 recipe/tip), 아니면 빈 문자열로 둬.
+  · 첫 줄은 제목 한 줄 — iOS 메모는 첫 줄이 곧 제목이다
+  · 둘째 줄부터 본문. category에 맞게 정리:
+      recipe -> 재료와 분량, 조리 순서를 단계별로 빠짐없이
+      tip    -> 핵심 정보를 항목별로
+      place/event -> 영업시간·가격·예약 등 방문에 필요한 정보만
+  · 버릴 것: "28K likes, 213 comments - 계정명 - June 12, 2026:" 같은 SNS
+    메타데이터, 공구/할인/프로필 링크/배송 안내 등 홍보 문구, 계정
+    태그(@xxx), "꼭 드셔보세요 ❤️" 같은 인사말·감탄사
+  · 지키지 말고 그대로 둘 것: 재료명과 분량("감자 3개 500g", "간장 1T"),
+    온도·시간("7~10분") 등 숫자와 단위는 원문 그대로. 압축하거나 바꾸지 마
+  · 본문에 없는 내용을 지어내지 마 — 정리만 하고 창작하지 말 것
 - place_name / address / event_title / event_date는 본문에 실제로 명시된
   경우만 채우고, 없으면 비워둬 (본문에 없는 값을 지어내지 마)
 - region은 동/구 단위 지역명 (예: 연남동, 성수동) — place일 때 지도 검색
@@ -143,15 +156,13 @@ _CALENDAR_ACTION_DECL = types.FunctionDeclaration(
 
 _MEMO_ACTION_DECL = types.FunctionDeclaration(
     name="create_memo_deeplink",
-    description="장소/일정과 무관한 정보성 콘텐츠(레시피, 꿀팁 등)라서 메모 앱에 저장해두면 좋을 때 호출.",
-    parameters={
-        "type": "OBJECT",
-        "properties": {
-            "text": {"type": "STRING", "description": "메모에 저장할 핵심 요약 텍스트"},
-        },
-        "required": ["text"],
-    },
+    description=(
+        "memo_body에 저장할 내용이 있으면 호출. 인자는 없다 — 본문은 1차 분석에서 "
+        "이미 만들어져 있고 서버가 주입하므로, 여기서 본문을 다시 쓰지 마."
+    ),
+    parameters={"type": "OBJECT", "properties": {}},
 )
+
 
 _ACTION_TOOLS: Final = [
     types.Tool(
@@ -175,14 +186,16 @@ _ACTION_PROMPT_TEMPLATE = """\
     (예: 주소가 있는 팝업스토어/전시는 캘린더 + 지도 둘 다 필요)
 - event_title에 값이 있으면
   → create_calendar_deeplink 호출 (event_date는 있으면 같이 넘기고 없으면 생략)
-- 위 두 조건에 모두 해당하지 않지만 저장해둘 만한 정보성 요약(summary)이 있으면
-  → create_memo_deeplink 호출
+- memo_body가 "있음"이면 -> create_memo_deeplink 호출 (인자 없음)
+  -> 장소/일정 액션과 배타적이지 않다. 둘 다 해당하면 둘 다 호출
 
 - 값이 없는 필드를 근거로 삼아 호출하지 마
 - 조건에 안 맞으면 억지로 호출하지 말 것
 
 [분석 결과]
 {analysis_json}
+
+memo_body: {has_memo_body}
 """
 
 
@@ -328,7 +341,7 @@ def _is_retryable_error(exc: Exception) -> bool:
 class LLMAnalyzer:
     def __init__(self):
         self.client = genai_client
-        self.model = "gemini-3.5-flash-lite"
+        self.model = "gemini-3.1-flash-lite"
         self.fallback_model = _FALLBACK_MODEL
 
     async def _call_gemini_raw(
@@ -399,7 +412,9 @@ class LLMAnalyzer:
         """
         config = types.GenerateContentConfig(
             temperature=0.0,
-            max_output_tokens=2000,
+            # memo_body(정제된 원문)가 응답에 실리므로 예산을 넉넉히 잡는다.
+            # 한국어는 대략 1자 ≈ 1토큰이라 원문 4000자면 출력도 그만큼 나온다.
+            max_output_tokens=5000,
             response_mime_type="application/json",
             response_schema=LLMExtraction,
             # gemini-3.5-flash의 내부 reasoning(thinking) 토큰이
@@ -428,15 +443,24 @@ class LLMAnalyzer:
         선택하게 한다. category별 if/elif 분기 없이, 모델이 호출한 함수
         이름 + 인자를 기본적으로 그대로 ActionCall로 담아 반환한다.
 
-        단, create_map_deeplink의 query만은 예외적으로 코드에서 재구성한다
-        (_build_map_query 참고) — 지도 검색 쿼리는 LLM의 자유 조합보다
-        "상호명 우선, 없으면 주소" 규칙을 결정론적으로 따르는 게 검색
-        정확도가 훨씬 높기 때문.
+        단, 아래 두 인자만은 예외적으로 코드에서 채운다:
+        - create_map_deeplink의 query (_build_map_query 참고) — 지도 검색
+          쿼리는 LLM의 자유 조합보다 "상호명 우선, 없으면 주소" 규칙을
+          결정론적으로 따르는 게 검색 정확도가 훨씬 높기 때문.
+        - create_memo_deeplink의 text — 1차 분석에서 이미 만들어둔
+          memo_body를 그대로 넣는다. 이 프롬프트에는 원문이 없어서 LLM이
+          본문을 다시 쓸 수도 없고, 쓰게 하면 원문을 두 번 보내는 셈이라
+          토큰이 두 배가 된다.
 
         실패하거나 아무 함수도 호출하지 않으면 빈 리스트를 반환한다.
         """
-        analysis_json = analysis.model_dump_json(exclude={"actions"})
-        prompt = _ACTION_PROMPT_TEMPLATE.format(analysis_json=analysis_json)
+        # memo_body는 수백 자라 프롬프트에 통째로 넣으면 토큰만 낭비된다.
+        # 액션 선택에 필요한 건 "있냐 없냐"뿐이므로 유무만 넘긴다.
+        analysis_json = analysis.model_dump_json(exclude={"actions", "memo_body"})
+        prompt = _ACTION_PROMPT_TEMPLATE.format(
+            analysis_json=analysis_json,
+            has_memo_body="있음" if analysis.memo_body else "없음",
+        )
 
         config = types.GenerateContentConfig(
             temperature=0.0,
@@ -464,8 +488,21 @@ class LLMAnalyzer:
                 built_query = _build_map_query(analysis)
                 if built_query:
                     args["query"] = built_query
+            elif fc.name == "create_memo_deeplink":
+                # 본문은 1차 분석의 memo_body를 그대로 주입. 비어있으면
+                # 넣을 게 없으므로 액션 자체를 버린다.
+                if not analysis.memo_body:
+                    logger.info("memo_body 비어있음 → create_memo_deeplink 무시")
+                    continue
+                args["text"] = analysis.memo_body
             actions.append(ActionCall(action=fc.name, args=args))
-            logger.info("LLM이 액션 선택: %s(%s)", fc.name, args)
+            # 메모 본문이 통째로 로그에 찍히지 않도록 인자 키/길이만 남긴다
+            logger.info(
+                "LLM이 액션 선택: %s(keys=%s, sizes=%s)",
+                fc.name,
+                list(args),
+                {k: len(str(v)) for k, v in args.items()},
+            )
 
         return actions
 
@@ -529,11 +566,13 @@ class LLMAnalyzer:
             region = extraction.region or None
             event_title = extraction.event_title or None
             event_date = extraction.event_date or None
+            memo_body = (extraction.memo_body or "").strip()
         else:
             logger.warning("Gemini 구조화 응답 획득 실패 → 안전 폴백으로 진행")
             category = "other"
             summary = _fallback_summary(raw_text)
             tags = []
+            memo_body = ""
             place_name = address = region = event_title = event_date = None
 
         # 안전장치: place_name/address는 뽑혔는데 category만 "other"로
@@ -552,6 +591,7 @@ class LLMAnalyzer:
                 event_title=event_title,
                 event_date=event_date,
                 tags=tags,
+                memo_body=memo_body,
             )
         except ValidationError as e:
             # 스펙 불일치로 인한 크래시 방지: 최소 필드만으로 안전하게 폴백
@@ -572,10 +612,11 @@ class LLMAnalyzer:
             logger.warning("액션 선택 실패, 액션 없이 진행: %s", e)
 
         logger.info(
-            "LLM 분석 완료: category=%s, place_name=%s, region=%s, actions=%s",
+            "LLM 분석 완료: category=%s, place_name=%s, region=%s, memo_body=%d자, actions=%s",
             analysis_result.category,
             analysis_result.place_name,
             analysis_result.region,
+            len(analysis_result.memo_body),
             [a.action for a in analysis_result.actions],
         )
         return analysis_result
