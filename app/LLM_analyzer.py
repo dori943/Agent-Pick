@@ -1,14 +1,28 @@
-"""LLM 분석 모듈 스텁.
+"""Gemini 기반 콘텐츠 분석 모듈.
 
-타 담당자가 구현 예정.
-파이프라인 연동을 위해 인터페이스와 더미 응답만 정의한다.
+크롤링된 og:description 원문을 팀 공용 스펙(models.AnalysisResult)에 맞춰
+구조화한다. category 값은 반드시 models.py / deeplink.py / database.py가
+공유하는 영문 5종("place" | "event" | "recipe" | "tip" | "other")과
+일치해야 하며, 여기서 어긋나면 지도 딥링크 생성과 Notion 조건부 속성
+저장이 전부 스킵된다.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import re
+import time
+from typing import Any, Final
 
-from app.models import AnalysisResult, CrawlResult
+import httpx
+from google import genai
+from google.genai import types
+from pydantic import ValidationError
+
+from app.models import ActionCall, AnalysisResult, LLMExtraction
+from app.naver_map import search_place
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +37,7 @@ genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ── 429(Rate Limit) 대응 설정 ────────────────────────────
 _MAX_INPUT_CHARS: Final = 4000  # 제미나이에 보내는 본문 최대 길이 (토큰 절약)
-_MIN_REQUEST_INTERVAL: Final = 2.0  # 연속 호출 사이 최소 간격(초) — 무료 플랜 RPM 방어
+_MIN_REQUEST_INTERVAL: Final = 3.0  # 연속 호출 사이 최소 간격(초) — 무료 플랜 RPM 방어
 _MAX_RETRIES: Final = 3
 _RETRY_BACKOFF_BASE: Final = 3.0  # 초. 429 발생 시 시도 횟수만큼 지수적으로 대기
 
@@ -34,7 +48,7 @@ _last_call_ts: float = 0.0
 
 # 주 모델이 429/503 등으로 재시도까지 전부 실패하면 이 모델로 한 번 더
 # 시도한다. 에이전트 신뢰성(안 죽고 응답 주기)이 속도/최신성보다 우선.
-_FALLBACK_MODEL: Final = "gemini-2.5-flash"
+_FALLBACK_MODEL: Final = "gemini-3.1-flash-lite"
 
 # ── 팀 공용 category 스펙 (models.py / deeplink.py / database.py와 동일해야 함) ──
 _VALID_CATEGORIES: Final = {"place", "event", "recipe", "tip", "other"}
@@ -96,9 +110,11 @@ _MAP_ACTION_DECL = types.FunctionDeclaration(
             "query": {
                 "type": "STRING",
                 "description": (
-                    "지도 검색에 쓸 쿼리. 주소와 상호명을 조합해서 만들어줘 "
-                    "(예: '마포구 희우정로20길 70 온리디스베이커리'). "
-                    "주소가 없으면 상호명+지역명만이라도 조합."
+                    "장소명 또는 주소 중 실제로 값이 있는 걸 그대로 채워줘 "
+                    "(둘 다 있으면 장소명을 우선 채운다). 이 값은 호출 여부 "
+                    "판단용으로만 쓰이고, 실제 지도 검색 쿼리는 서버 코드가 "
+                    "place_name/address 우선순위 규칙으로 별도 구성하니 "
+                    "이름과 주소를 한 문장으로 합치려 하지 마."
                 ),
             }
         },
@@ -168,6 +184,26 @@ _ACTION_PROMPT_TEMPLATE = """\
 [분석 결과]
 {analysis_json}
 """
+
+
+def _build_map_query(analysis: AnalysisResult) -> str:
+    """지도 검색 쿼리를 결정론적으로 구성한다.
+
+    상호명(place_name)이 있으면 그것만(+구분이 필요하면 region) 우선
+    사용하고, 상호명이 없을 때만 주소(address)를 쓴다. 상호명과 전체
+    도로명주소를 한 문자열로 합치면 지도 검색엔진이 오히려 매칭에
+    실패하는 경우가 많아 LLM이 만든 조합 쿼리는 쓰지 않고 여기서 새로
+    만든다.
+    """
+    if analysis.place_name:
+        # region이 place_name에 이미 포함돼 있지 않으면 동명이인/동명업체
+        # 구분을 위해 지역명을 붙여준다 (예: "성수동 어니언").
+        if analysis.region and analysis.region not in analysis.place_name:
+            return f"{analysis.region} {analysis.place_name}"
+        return analysis.place_name
+    if analysis.address:
+        return analysis.address
+    return ""
 
 
 def _normalize_category(raw: Any) -> str:
@@ -292,7 +328,7 @@ def _is_retryable_error(exc: Exception) -> bool:
 class LLMAnalyzer:
     def __init__(self):
         self.client = genai_client
-        self.model = "gemini-3.5-flash"
+        self.model = "gemini-3.5-flash-lite"
         self.fallback_model = _FALLBACK_MODEL
 
     async def _call_gemini_raw(
@@ -390,7 +426,12 @@ class LLMAnalyzer:
     async def _choose_actions(self, analysis: AnalysisResult) -> list[ActionCall]:
         """분석 결과를 바탕으로 LLM이 Function Calling으로 액션을 직접
         선택하게 한다. category별 if/elif 분기 없이, 모델이 호출한 함수
-        이름 + 인자를 그대로 ActionCall로 담아 반환한다.
+        이름 + 인자를 기본적으로 그대로 ActionCall로 담아 반환한다.
+
+        단, create_map_deeplink의 query만은 예외적으로 코드에서 재구성한다
+        (_build_map_query 참고) — 지도 검색 쿼리는 LLM의 자유 조합보다
+        "상호명 우선, 없으면 주소" 규칙을 결정론적으로 따르는 게 검색
+        정확도가 훨씬 높기 때문.
 
         실패하거나 아무 함수도 호출하지 않으면 빈 리스트를 반환한다.
         """
@@ -417,6 +458,12 @@ class LLMAnalyzer:
             if fc is None:
                 continue
             args = dict(fc.args) if fc.args else {}
+            if fc.name == "create_map_deeplink":
+                # LLM이 만든 query는 호출 여부 판단용 신호일 뿐, 실제 검색
+                # 쿼리는 place_name 우선 규칙으로 여기서 새로 구성한다.
+                built_query = _build_map_query(analysis)
+                if built_query:
+                    args["query"] = built_query
             actions.append(ActionCall(action=fc.name, args=args))
             logger.info("LLM이 액션 선택: %s(%s)", fc.name, args)
 
